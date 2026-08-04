@@ -1,0 +1,1499 @@
+--=====================================================================
+-- Sniper Arena — Overnight Ranked Farm (autoexec)
+--=====================================================================
+-- Put this in autoexec and leave it. It:
+--   * ranked-queues, plays with a built-in ragebot (pathfinds to targets),
+--   * normalizes K/D so you don't sit at a 100% winrate (loses ~3% on purpose),
+--   * auto-buys + opens the [Strike] Mystic Case with coins,
+--   * auto-sells Common/UnCommon/Rare/Epic skins (never Legendary+, never locked/favorited),
+--   * auto-equips your most valuable glove / knife / gun (SSG),
+--   * auto-claims free case sources (mailbox, battlepass),
+--   * reports rank / stats / net worth / kills / level to a Discord webhook every 30 min,
+--   * tracks uptime in getgenv so a re-exec doesn't reset the session.
+--
+-- SAFETY: auto-sell only ever touches Common/UnCommon/Rare/Epic AND respects the game's own
+-- CanSell (which blocks locked, favorited, starter, unsellable and Exotic+ items). It can never
+-- sell a Legendary/Mystic/Exotic/Secret. Leave AutoSell off on your first run and watch the log.
+--=====================================================================
+
+-- CONFIG ---------------------------------------------------------------
+local webhookUrl = "https://discord.com/api/webhooks/1534239420285325432/FB0ALduuUxKv4Q7IUH5APoGFPHoaWHy24f9oQsooEumnbinXWHx2QI_H4eAiQTTzQz52"
+
+local Config = {
+    RankedQueue   = nil,           -- nil = auto-resolve the ranked 1v1 queue from the game config
+                                   -- (set a string here to force a specific queue key)
+
+    -- Anti-crash pacing. The game crashes if we hammer everything on the first frame / all at once,
+    -- so we wait for it to fully load, then space every heavy action out.
+    StartupDelay  = 5,             -- seconds to idle after remotes appear before acting, so the game's
+                                   -- modules are fully loaded/initialized in the GC before we resolve them
+    ActionGap     = 1.5,           -- min seconds between two heavy remote actions (buy/sell/equip/claim)
+    LoopInterval  = 12,            -- seconds between full farm-action passes
+
+    VisualizePath = true,          -- draw the pathfinding waypoints while walking to a target
+
+    Ragebot       = true,
+    Prediction    = 1.34,          -- velocity lead factor (1.0 = full ping lead, like Skeet's 100%)
+    WallCheck     = true,          -- prefer body points with clear line of sight (falls back to head)
+    CameraLock    = true,          -- smoothly aim the real camera at the target (continuous tracking)
+    CamSmooth     = 0.18,          -- 0..1 lerp per frame — lower = smoother/lazier (less sus)
+    CamJitter     = 0.45,          -- studs of random jitter on the aim point so it's not pixel-locked
+    Pathfind      = true,          -- walk to the current target with PathfindingService
+    WalkSpeed     = 26,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
+                                   -- cancelled by MoveTo, so we just set speed directly instead.
+    AutoRequeue   = true,
+    BanMapName    = "Grid",        -- always ban this map if it's in the ban pool (nil = random ban)
+
+    KDNormalizer  = true,
+    LossRate      = 0.03,          -- lose ~3% of games on purpose (whiff the whole game)
+
+    AutoBuyCase   = true,
+    CaseKey       = "StrikeCase_Mystic",        -- gacha key that gets opened
+    BuyProduct    = "StrikeCase_Mystic_x1",     -- ShopService product id
+    CaseKeepCoins = 0,             -- keep at least this many coins in reserve (0 = spend freely)
+
+    AutoOpenCase  = true,
+    InstaSkip     = true,          -- skip the case-opening animation
+    AutoSell      = false,         -- OFF by default — verify behaviour before trusting it overnight
+    AutoEquip     = true,          -- equip most valuable glove / knife / SSG
+    AutoClaim     = true,          -- mailbox + battlepass free rewards
+
+    ReportEvery   = 30 * 60,       -- webhook report interval (seconds)
+
+    Debug         = true,          -- log state + surface swallowed errors (turn off once it's stable)
+}
+
+local SellRarities = {
+    Common = true, UnCommon = true, Rare = true, Epic = true,
+}
+
+--=====================================================================
+-- Boilerplate
+--=====================================================================
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local RunService          = game:GetService("RunService")
+local PathfindingService  = game:GetService("PathfindingService")
+local Workspace           = game:GetService("Workspace")
+local HttpService         = game:GetService("HttpService")
+local Stats               = game:GetService("Stats")
+
+-- Autoexec injects before the player exists, so Players.LocalPlayer can be nil at load. Wait for it
+-- instead of capturing nil (which later crashed LocalCharacter with "index nil with 'Character'").
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+local Camera = Workspace.CurrentCamera
+
+local FARM_VERSION = "2026-08-04-r15"
+
+local function Log(...)
+    print("[farm]", ...)
+end
+
+-- Loud build banner: if you don't see THIS exact version in the console, you're running an old copy.
+warn("========== farm.lua BUILD " .. FARM_VERSION .. " ==========")
+
+-- pcall that surfaces the FIRST error per label (instead of silently swallowing it), so a broken
+-- gate is visible in the console instead of just "nothing happens".
+local ErrLogged = {}
+local function SafeCall(label, fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok and not ErrLogged[label] then
+        ErrLogged[label] = true
+        Log("ERROR in", label, "->", tostring(err))
+    end
+    return ok
+end
+
+-- Universal executor HTTP request.
+local function HttpPost(url, body)
+    local req = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+    if not req then return false end
+    return pcall(req, {
+        Url = url,
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body,
+    })
+end
+
+-- Safe require of a game module.
+local function Require(path)
+    local ok, mod = pcall(require, path)
+    if ok then return mod end
+    return nil
+end
+
+--=====================================================================
+-- Anti-crash pacing
+--=====================================================================
+-- Executors fire autoexec the instant they inject — long before the game's scripts/remotes exist.
+-- Touching remotes or spamming actions that early is the #1 cause of the client crashing, so we
+-- gate everything behind "the game is actually ready", then throttle heavy actions so no single
+-- tick does too much work.
+
+local Ready = false
+
+local function WaitForGameReady()
+    -- 1) engine content loaded
+    if not game:IsLoaded() then
+        game.Loaded:Wait()
+    end
+    Log("engine loaded")
+
+    -- 2) the remote tree the farm depends on has replicated in (bounded — never block forever).
+    -- NOTE: we deliberately do NOT wait on the character here. On the match-over scoreboard the
+    -- character is despawned, so CharacterAdded would never fire until the next round — that would
+    -- hang the whole farm and stop it requeueing. Combat already gates on IsGaming() at runtime,
+    -- so a nil character between rounds is fine.
+    local deadline = os.clock() + 30
+    repeat
+        local remote = ReplicatedStorage:FindFirstChild("Remote")
+        if remote and remote:FindFirstChild("MatchmakingService") then
+            break
+        end
+        task.wait(0.25)
+    until os.clock() > deadline
+    Log("remotes present")
+
+    -- 3) wait until the in-game HUD is built — the ban-screen element only exists once every remote/
+    -- module has fully loaded, so this is a rock-solid "everything's ready" signal (per your tip).
+    -- Bounded so a mid-match exec (HUD already past ban phase but present) doesn't hang.
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 15)
+    local hudDeadline = os.clock() + 45
+    repeat
+        local node = pg and pg:FindFirstChild("Hud")
+        node = node and node:FindFirstChild("Game")
+        node = node and node:FindFirstChild("BanMap")
+        if node then break end
+        task.wait(0.25)
+    until os.clock() > hudDeadline
+    Log("hud ready (ban screen built)")
+
+    -- 4) tiny settle, then go live
+    task.wait(Config.StartupDelay)
+    Ready = true
+    Log("game ready — farm going live")
+end
+
+-- Run a heavy action but never faster than Config.ActionGap since the last heavy action, so a full
+-- farm pass is spread out across time instead of slamming the client in one frame.
+local LastAction = 0
+local function Throttled(fn)
+    local wait = Config.ActionGap - (os.clock() - LastAction)
+    if wait > 0 then task.wait(wait) end
+    LastAction = os.clock()
+    return pcall(fn)
+end
+
+--=====================================================================
+-- getgenv uptime (survives re-exec)
+--=====================================================================
+local Session = getgenv().__FarmSession
+if not Session then
+    Session = {
+        StartClock = os.clock(),
+        StartTime  = os.time(),
+        Kills = 0, Deaths = 0,
+        Wins = 0, Losses = 0,
+        CasesOpened = 0, ItemsSold = 0, CoinsFromSells = 0,
+        Running = true,
+        Version = 0,
+    }
+    getgenv().__FarmSession = Session
+else
+    Session.Running = true
+end
+Session.Version += 1
+local MyVersion = Session.Version   -- lets an older copy of the script bow out if re-executed
+
+local function Alive()
+    return Session.Running and Session.Version == MyVersion
+end
+
+local function Uptime()
+    return os.time() - Session.StartTime
+end
+
+local function FormatDuration(sec)
+    sec = math.floor(sec)
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+--=====================================================================
+-- Game services (lazy — may not exist until loaded)
+--=====================================================================
+-- Find an already-loaded module table in the GC by keys unique to it. Your executor (SynZ) doesn't
+-- share the game's require cache — re-requiring re-runs the module, which yields/errors on the heavy
+-- ones (GameService, etc.). So when require fails we grab the LIVE singleton the game already built.
+-- getgc(true) is a full heap scan — brutal to call every frame. Cache the snapshot for 2s so all
+-- services resolve from ONE scan, and unresolved ones only re-scan every 2s instead of per-frame.
+local _gcSnapshot, _gcSnapTime = nil, -1e9
+local function FindLoadedModule(sigKeys)
+    if type(getgc) ~= "function" then return nil end
+    if not _gcSnapshot or os.clock() - _gcSnapTime > 2 then
+        _gcSnapshot = getgc(true)
+        _gcSnapTime = os.clock()
+    end
+    for _, obj in ipairs(_gcSnapshot) do
+        if type(obj) == "table" then
+            local match = true
+            for i = 1, #sigKeys do
+                if rawget(obj, sigKeys[i]) == nil then match = false break end
+            end
+            if match then return obj end
+        end
+    end
+    return nil
+end
+
+-- Require a module; fall back to the live GC copy (matched by signature) if require fails.
+local function ResolveModule(inst, sigKeys)
+    local ok, mod = pcall(require, inst)
+    if ok and type(mod) == "table" then return mod end
+    return sigKeys and FindLoadedModule(sigKeys) or nil
+end
+
+-- Walk a child path with FindFirstChild so a missing/removed node returns nil instead of THROWING
+-- ("Remote is not a valid member of ReplicatedStorage"). The Remote folder isn't reliably dot-index-
+-- able during a match, and that throw was killing the ragebot, playagain AND the fire-hook install.
+local function SafeChild(root, ...)
+    local node = root
+    for _, seg in ipairs({ ... }) do
+        if not node then return nil end
+        node = node:FindFirstChild(seg)
+    end
+    return node
+end
+
+-- Each service caches its resolved module. `sig` = keys unique to that module for the GC fallback.
+local Svc = {}
+local function GetSvc(name, path, sig)
+    if not Svc[name] then   -- keep retrying until resolved (false = not yet)
+        Svc[name] = ResolveModule(path, sig) or false
+    end
+    return Svc[name] or nil
+end
+
+local function CombatService()   return GetSvc("Combat",   SafeChild(ReplicatedStorage, "Remote", "CombatService"), { "GetCurrentWeapon", "GetWeaponSlot", "SwitchSlot" }) end
+local function WeaponService()   return GetSvc("Weapon",   SafeChild(ReplicatedStorage, "Remote", "WeaponService"), { "GetContent", "Sell", "CanSell" }) end
+local function GachaService()    return GetSvc("Gacha",    SafeChild(ReplicatedStorage, "Remote", "GachaService"), { "Gacha", "GetGachaCount" }) end
+local function Matchmaking()     return GetSvc("Match",    SafeChild(ReplicatedStorage, "Remote", "MatchmakingService"), { "Match", "Cancel" }) end
+local function EquipmentService()return GetSvc("Equip",    SafeChild(ReplicatedStorage, "Remote", "EquipmentService"), { "SetEquip" }) end
+local function RapService()      return GetSvc("Rap",      SafeChild(ReplicatedStorage, "Remote", "WeaponRapService"), { "GetRap" }) end
+local function Mailbox()         return GetSvc("Mailbox",  SafeChild(ReplicatedStorage, "Remote", "MailboxService"), { "GetAll", "Claim" }) end
+local function Battlepass()      return GetSvc("Battlepass", SafeChild(ReplicatedStorage, "Remote", "BattlepassService"), { "ClaimPremiumReward" }) end
+local function EntityService()   return GetSvc("Entity",   SafeChild(ReplicatedStorage, "Remote", "EntityService"), { "GetLocalEntity", "GetEntity", "FetchEntity" }) end
+local function WeaponDataHelper()return GetSvc("WDH",      SafeChild(ReplicatedStorage, "Common", "WeaponService", "WeaponDataHelper"), { "GetConfig", "Name", "Price", "WearFactor" }) end
+local function ShootComponent()  return GetSvc("Shoot",    SafeChild(ReplicatedStorage, "Common", "CombatService", "CommonComponent", "CommonShootableComponent"), { "Shoot", "GetSpread", "StartShooting", "Action" }) end
+
+-- GameService: cached singleton; require first, GC fallback second. IsGaming/room/ban/vote/rematch
+-- all hang off this, so it MUST resolve.
+local _gameServiceMod
+local _gsLogged = false
+local function GameService()
+    if _gameServiceMod then return _gameServiceMod end
+    local remote = ReplicatedStorage:FindFirstChild("Remote")
+    local svc = remote and remote:FindFirstChild("GameService")
+
+    local viaRequire = false
+    local reqOk, reqMod = pcall(require, svc)
+    if reqOk and type(reqMod) == "table" then _gameServiceMod, viaRequire = reqMod, true end
+
+    if not _gameServiceMod then
+        _gameServiceMod = FindLoadedModule({ "IsGaming", "IsJoined", "RoomManager", "VoteMap", "BanMap" })
+    end
+
+    if _gameServiceMod and not _gsLogged then
+        _gsLogged = true
+        Log("GameService resolved via " .. (viaRequire and "require" or "GC"))
+    end
+    return _gameServiceMod
+end
+
+--=====================================================================
+-- Game state  (loading vs lobby vs map-voting vs live round)
+--=====================================================================
+-- The game runs you through: loading screen -> lobby -> matchmaking -> map vote -> LIVE round.
+-- GameService tells us exactly which phase we're in, so the ragebot only fires during a live round
+-- and never wastes shots (or crashes) on a loading/lobby/voting screen.
+local function IsGaming()   -- true ONLY while an actual round is live
+    local gs = GameService()
+    if not gs or not gs.IsGaming then return false end
+    local ok, v = pcall(gs.IsGaming)
+    return ok and v == true
+end
+
+local function IsJoined()   -- true once we've joined a match client (round or its pre-round phases)
+    local gs = GameService()
+    if not gs or not gs.IsJoined then return false end
+    local ok, v = pcall(gs.IsJoined)
+    return ok and v == true
+end
+
+local function GetFocusedRoom()
+    local gs = GameService()
+    local rm = gs and gs.RoomManager
+    if not rm or not rm.GetFocusedRoom then return nil end
+    local ok, room = pcall(rm.GetFocusedRoom)
+    return ok and room or nil
+end
+
+-- True while sitting on the match-over / results screen (round has ended or is ending). Read from
+-- the room's authoritative GameState, so it's correct even if we EXECUTE on the endgame screen and
+-- never saw the round go live.
+local function RoomEnded()
+    local room = GetFocusedRoom()
+    if not room then return false end
+    local ok, ended = pcall(function()
+        return room:IsEnded() or room:IsEnding()
+    end)
+    return ok and ended or false
+end
+
+-- Fire the endgame "Play Again" button. It re-queues the SAME queue straight from the results screen
+-- (no trip back to the lobby): MatchmakingService.Match(queue) -> ModeHandler:Rematch(false) -> Pause.
+-- Replicates Hud/Game/EndList/Bottom/ContinueAgain exactly.
+local LastPlayAgain = 0
+local function PlayAgain()
+    if not RoomEnded() then return end                 -- only on the endgame screen
+    if os.clock() - LastPlayAgain < 2 then return end  -- don't double-fire during the transition
+
+    local room = GetFocusedRoom()
+    if not room then if Config.Debug then Log("playagain: no focused room") end return end
+
+    -- The requeue key lives on the mode handler. If it's present we can rematch — no need to gate on
+    -- IsModeSet (which was silently blocking this).
+    local handler = room.ModeHandler
+    local queue = handler and handler.MatchmakingQueue
+    if not queue or #queue == 0 then
+        if Config.Debug then Log("playagain: no MatchmakingQueue (handler=" .. tostring(handler ~= nil) .. ")") end
+        return
+    end
+
+    local mm = Matchmaking()
+    if not mm then return end
+    if mm.Matching then if Config.Debug then Log("playagain: already matching") end return end
+
+    LastPlayAgain = os.clock()
+    Log("play again ->", queue)
+
+    -- Match() can yield on the _Ready flag; spawn so the endgame screen requeues without blocking.
+    task.spawn(function()
+        pcall(mm.Match, queue)                                      -- requeue the same ranked queue
+        pcall(function() if handler.Rematch then handler:Rematch(false) end end)
+        local gs = GameService()
+        if gs and gs.Pause then pcall(gs.Pause) end
+    end)
+end
+
+-- Map selection is a BAN phase (RoomState.BanMap) followed by a VOTE phase (RoomState.Vote). Both
+-- stall the round if we're AFK and don't act, so handle whichever the room is currently in.
+--   ban:  GameService.BanMap(map, clickPos)   from room.BanMaps.Maps
+--   vote: GameService.VoteMap(map, clickPos)  from room.VotingMaps.Maps
+local CENTER = UDim2.new(0.5, 0, 0.5, 0)
+local function AutoMapPhase()
+    local gs = GameService()
+    local room = GetFocusedRoom()
+    if not gs or not room then return end
+
+    local ok, state = pcall(function() return room:GetState() end)
+    if not ok then return end
+
+    if state == "BanMap" and gs.BanMap then
+        if LocalPlayer:GetAttribute("BanMap") then return end       -- already banned this round
+        local bm = room.BanMaps
+        if type(bm) ~= "table" or type(bm.Maps) ~= "table" or #bm.Maps == 0 then return end
+        if Workspace:GetServerTimeNow() > (bm.Timeout or 0) then return end
+
+        -- Prefer banning the configured map (Grid) if it's in the pool; otherwise random.
+        local pick
+        if Config.BanMapName then
+            for i = 1, #bm.Maps do
+                if bm.Maps[i] == Config.BanMapName then pick = bm.Maps[i] break end
+            end
+        end
+        pick = pick or bm.Maps[math.random(1, #bm.Maps)]
+
+        pcall(gs.BanMap, pick, CENTER)
+        Log("banned map", pick)
+
+    elseif state == "Vote" and gs.VoteMap then
+        if LocalPlayer:GetAttribute("VoteMap") then return end       -- already voted this round
+        local vm = room.VotingMaps
+        if type(vm) ~= "table" or type(vm.Maps) ~= "table" or #vm.Maps == 0 then return end
+        if Workspace:GetServerTimeNow() > (vm.Timeout or 0) then return end
+        local pick = vm.Maps[math.random(1, #vm.Maps)]
+        pcall(gs.VoteMap, pick, CENTER)
+        Log("voted map", pick)
+    end
+end
+
+--=====================================================================
+-- Ragebot  (compact, self-contained: pick nearest visible enemy, aim head, fire)
+--=====================================================================
+local Ragebot = {}
+Ragebot.CurrentTarget = nil
+Ragebot.WhiffThisGame = false        -- set by the K/D normalizer to throw the round
+
+local function LocalCharacter()
+    return LocalPlayer.Character
+end
+
+local function LocalRoot()
+    local c = LocalCharacter()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function IsFriendly(character)
+    -- Team-based: same Team = friendly. Falls back to false (treat as enemy) if teams unknown.
+    local plr = Players:GetPlayerFromCharacter(character)
+    if plr and plr.Team and LocalPlayer.Team then
+        return plr.Team == LocalPlayer.Team
+    end
+    return false
+end
+
+local function EnemyAlive(character)
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    return hum ~= nil and root ~= nil and hum.Health > 0
+end
+
+-- Body points we try to hit, in priority order (R15 + R6 covered).
+local HIT_POINTS = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
+
+-- Is this player friendly to us? Uses the game's own EntityService.IsFriendly (handles teams/1v1),
+-- falls back to Team, else treats as enemy.
+local function PlayerFriendly(plr)
+    local ent = EntityService()
+    if ent and ent.IsFriendly then
+        local ok, res = pcall(ent.IsFriendly, plr)
+        if ok and res ~= nil then return res end
+    end
+    if plr.Team and LocalPlayer.Team then return plr.Team == LocalPlayer.Team end
+    return false
+end
+
+-- Build a Skeet-style Data list of live enemies with their body parts (rebuilt each shot/frame).
+local function GatherEnemies()
+    local myRoot = LocalRoot()
+    local list = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local char = plr.Character
+            local hum  = char and char:FindFirstChildOfClass("Humanoid")
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if char and hum and root and hum.Health > 0 and not PlayerFriendly(plr) then
+                local parts = {}
+                for i = 1, #HIT_POINTS do
+                    local p = char:FindFirstChild(HIT_POINTS[i])
+                    if p and p:IsA("BasePart") then parts[HIT_POINTS[i]] = p end
+                end
+                list[#list + 1] = {
+                    Character = char, Player = plr, Humanoid = hum,
+                    RootPart = root, RootPosition = root.Position, BodyParts = parts,
+                    Distance = myRoot and (root.Position - myRoot.Position).Magnitude or 0,
+                }
+            end
+        end
+    end
+    return list
+end
+
+-- Nearest enemy CHARACTER, for pathfinding/CurrentTarget.
+local function GetNearestEnemy()
+    local best, bestDist = nil, math.huge
+    for _, d in ipairs(GatherEnemies()) do
+        if d.Distance < bestDist then bestDist = d.Distance; best = d.Character end
+    end
+    return best
+end
+
+--=====================================================================
+-- Wall-check raycasting  (exclude every character + local, use the Attack collision group — 1:1 Skeet)
+--=====================================================================
+local RayParams = RaycastParams.new()
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local LastRayRefresh = 0
+local function RefreshRayFilter(enemies)
+    if os.clock() - LastRayRefresh < 0.1 then return end
+    LastRayRefresh = os.clock()
+
+    local filter, n = {}, 0
+    local lc = LocalCharacter()
+    if lc then n = n + 1; filter[n] = lc end
+    local vm = Camera:FindFirstChild("ViewModel")
+    if vm then n = n + 1; filter[n] = vm end
+    for i = 1, #enemies do
+        if enemies[i].Character then n = n + 1; filter[n] = enemies[i].Character end
+    end
+    RayParams.FilterDescendantsInstances = filter
+
+    local ent = EntityService()
+    local le = ent and ent.GetLocalEntity and select(2, pcall(ent.GetLocalEntity))
+    if le and le.GetCollision then
+        local ok, col = pcall(le.GetCollision, le, "Attack")
+        if ok and col then RayParams.CollisionGroup = col end
+    end
+end
+
+local function RayBlocked(origin, goal)
+    return Workspace:Raycast(origin, goal - origin, RayParams) ~= nil
+end
+
+-- Sample points across a part to find one with clear line of sight (Skeet's SampleVisiblePoint).
+local function SampleVisiblePoint(origin, part)
+    local size, cf = part.Size, part.CFrame
+    local hx, hy = size.X * 0.35, size.Y * 0.35
+    local offsets = {
+        Vector3.new(0, 0, 0), Vector3.new(hx, 0, 0), Vector3.new(-hx, 0, 0),
+        Vector3.new(0, hy, 0), Vector3.new(0, -hy, 0), Vector3.new(hx, hy, 0), Vector3.new(-hx, -hy, 0),
+    }
+    for i = 1, #offsets do
+        local wp = (cf * CFrame.new(offsets[i])).Position
+        if not RayBlocked(origin, wp) then return wp end
+    end
+    return nil
+end
+
+--=====================================================================
+-- Resolver  (true server positions via the game's chrono custom replication)
+--=====================================================================
+-- Sniper Arena replicates real positions/velocities through ReplicatedStorage.Shared.chrono, and the
+-- rendered character LAGS behind that. Aiming at the rendered head misses on the server. We pull the
+-- true root CFrame + velocity from chrono, reproject our aim point onto the true position, and lead
+-- by velocity*ping — exactly what the Skeet ragebot does.
+local Resolver = {}
+
+-- Lazily require chrono the first time we actually need it (during a live round), inside a pcall'd
+-- closure so a not-yet-replicated path can't throw at load time. Cached; false = tried and absent.
+function Resolver.GetChrono()
+    if Resolver.Chrono == nil then
+        local ok, chrono = pcall(function()
+            return require(ReplicatedStorage.Shared.chrono.Client.Replicate)
+        end)
+        if not (ok and type(chrono) == "table") then
+            -- require failed (executor cache) — grab the live chrono singleton from the GC instead.
+            chrono = FindLoadedModule({ "idMap", "GetVelocity", "GetAllNetworkIds" })
+        end
+        Resolver.Chrono = chrono or false
+        if Resolver.Chrono and Config.Debug then Log("chrono resolved") end
+    end
+    return Resolver.Chrono or nil
+end
+
+local function GetPing()
+    local ok, ms = pcall(function() return Stats.PerformanceStats.Ping:GetValue() end)
+    return (ok and type(ms) == "number") and (ms / 1000) or 0   -- seconds, round-trip
+end
+
+-- Latest true root CFrame for a player from chrono's snapshot buffer, or nil.
+function Resolver.TrueRootCFrame(player)
+    local chrono = Resolver.GetChrono()
+    if not chrono or not player then return nil end
+
+    local ok, ids = pcall(chrono.GetAllNetworkIds)
+    if not ok or type(ids) ~= "table" then return nil end
+
+    for i = 1, #ids do
+        local entry = chrono.idMap[ids[i]]
+        if entry and entry.player == player then
+            local snap = entry.snapshot and entry.snapshot:GetLatest()
+            if snap and typeof(snap.value) == "CFrame" then return snap.value end
+            return nil
+        end
+    end
+    return nil
+end
+
+function Resolver.TrueVelocity(player, fallbackPart)
+    local chrono = Resolver.GetChrono()
+    if chrono and player then
+        local ok, v = pcall(chrono.GetVelocity, player)
+        if ok and typeof(v) == "Vector3" and v.Magnitude > 0 then return v end
+    end
+    return (fallbackPart and fallbackPart.AssemblyLinearVelocity) or Vector3.new()
+end
+
+-- Reproject a rendered aim point onto the true position, then add velocity lead. renderedRoot is the
+-- rendered HumanoidRootPart; renderedPoint is where we'd aim on the rendered model (e.g. Head).
+function Resolver.ResolveAim(player, renderedRoot, renderedPoint)
+    local point = renderedPoint
+
+    local trueCF = Resolver.TrueRootCFrame(player)
+    if trueCF and renderedRoot then
+        local delta = trueCF.Position - renderedRoot.Position
+        if delta.Magnitude <= 10 then          -- sane correction only; ignore garbage snapshots
+            point = point + delta
+        end
+    end
+
+    local lead = Resolver.TrueVelocity(player, renderedRoot) * (GetPing() * Config.Prediction)
+    if lead.Magnitude > 20 then lead = lead.Unit * 20 end   -- cap over-lead
+
+    return point + lead
+end
+
+--=====================================================================
+-- Silent-aim fire hooks
+--=====================================================================
+-- CRITICAL: the server registers damage from the Shoot action's Target + TargetPos (an object-space
+-- point on the target's root), NOT from where the camera points — see CommonShootableComponent's
+-- Request serializer (Target / TargetPos / TargetHeadshot / Direction / Spread). So we do NOT aim the
+-- camera. Autofire shoots in whatever direction we already face, and two hooks rewrite the outgoing
+-- action to point at the resolved target. This is exactly how the Skeet ragebot lands shots without
+-- looking, and it's the piece that was missing (a camera lookAt does nothing server-side).
+Ragebot.PendingRedirect = nil
+Ragebot.HooksInstalled = false
+
+-- Reproject a rendered world point onto the target's true (server) position — no lead (Skeet's
+-- ReprojectPoint). Returns the input unchanged if there's no valid true position.
+function Resolver.ReprojectPoint(player, renderedRoot, worldPoint)
+    local trueCF = Resolver.TrueRootCFrame(player)
+    if not renderedRoot or not trueCF then return worldPoint end
+    local delta = trueCF.Position - renderedRoot.Position
+    if delta.Magnitude > 10 then return worldPoint end   -- garbage snapshot, don't correct
+    return worldPoint + delta
+end
+
+-- SelectTarget: closest live enemy we actually have line of sight to. Skips a target whose root is
+-- wall-blocked AND whose head has no visible point — exactly Skeet's wall check.
+local function SelectTarget(enemies, origin)
+    local best, bestScore = nil, math.huge
+    for i = 1, #enemies do
+        local data = enemies[i]
+        if data.Humanoid.Health > 0 then
+            local blocked = false
+            if Config.WallCheck and origin then
+                local rootPos = data.RootPosition
+                local trueCF = Resolver.TrueRootCFrame(data.Player)
+                if trueCF and (trueCF.Position - rootPos).Magnitude <= 10 then rootPos = trueCF.Position end
+
+                local rootBlocked = RayBlocked(origin, rootPos)
+                local head = rootBlocked and data.BodyParts["Head"]
+                local visibleHead = head and SampleVisiblePoint(origin, head)
+                if rootBlocked and not visibleHead then blocked = true end
+            end
+
+            if not blocked and data.Distance < bestScore then
+                bestScore = data.Distance
+                best = data
+            end
+        end
+    end
+    return best
+end
+
+-- PickPoint: choose the best VISIBLE body point (Head first), reproject to true pos, add velocity
+-- lead. Returns (part, worldPosition) or nil if every candidate is wall-blocked. 1:1 with Skeet.
+local function PickPoint(data, origin)
+    local candidates = {}
+    for i = 1, #HIT_POINTS do
+        local p = data.BodyParts[HIT_POINTS[i]]
+        if p then candidates[#candidates + 1] = p end
+    end
+
+    if #candidates == 0 then return nil end
+
+    local part, visiblePoint
+    for i = 1, #candidates do
+        local cand = candidates[i]
+        if not Config.WallCheck or not origin then part = cand break end
+        if not RayBlocked(origin, cand.Position) then part = cand break end
+        local sampled = SampleVisiblePoint(origin, cand)
+        if sampled then part = cand; visiblePoint = sampled break end
+    end
+
+    -- No visible point (fully wall-blocked) → no shot, exactly like Skeet. Pathfinding walks us to LoS.
+    if not part then return nil end
+
+    local position = visiblePoint or part.Position
+    position = Resolver.ReprojectPoint(data.Player, data.RootPart, position)
+
+    local lead = Resolver.TrueVelocity(data.Player, data.RootPart) * (GetPing() * Config.Prediction)
+    if lead.Magnitude > 20 then lead = lead.Unit * 20 end
+    position = position + lead
+
+    return part, position
+end
+
+local function InstallFireHooks()
+    if Ragebot.HooksInstalled then return end
+    if not (hookfunction and newcclosure) then
+        Log("executor lacks hookfunction/newcclosure — silent aim unavailable")
+        return
+    end
+
+    local shootMod  = ShootComponent()
+    local entitySvc = EntityService()
+    local combat    = CombatService()
+    if not shootMod or not entitySvc or not combat then
+        if Config.Debug then
+            Log(("hooks waiting: shoot=%s entity=%s combat=%s"):format(
+                tostring(shootMod ~= nil), tostring(entitySvc ~= nil), tostring(combat ~= nil)))
+        end
+        return   -- retried by the install loop until all three resolve
+    end
+
+    local shootAction = shootMod.Action and shootMod.Action.Shoot
+
+    -- 1) Redirect OUR shots at the resolved target, and stash the redirect for the action hook.
+    local oldShoot
+    oldShoot = hookfunction(shootMod.Shoot, newcclosure(function(self, start, dir, params)
+        if typeof(start) ~= "Vector3" or typeof(dir) ~= "Vector3" or not self or not self.Holder then
+            return oldShoot(self, start, dir, params)
+        end
+        Ragebot.HookFires = (Ragebot.HookFires or 0) + 1
+
+        -- Only skip if we can POSITIVELY confirm this is another entity's shot; if we can't tell,
+        -- assume it's ours (the strict version was silently dropping all redirects).
+        local okHolder, holderEntity = pcall(self.GetHolderEntity, self)
+        local okLocal, localEntity = pcall(entitySvc.GetLocalEntity)
+        if okHolder and okLocal and localEntity and holderEntity and holderEntity ~= localEntity then
+            return oldShoot(self, start, dir, params)
+        end
+        Ragebot.FilterPass = (Ragebot.FilterPass or 0) + 1
+
+        if not (Config.Ragebot and Ready and IsGaming() and not Ragebot.WhiffThisGame) then
+            return oldShoot(self, start, dir, params)
+        end
+
+        local enemies = GatherEnemies()
+        if Config.WallCheck then RefreshRayFilter(enemies) end
+        local target = SelectTarget(enemies, start)
+        if target then
+            local part, position = PickPoint(target, start)
+            if part and position then
+                Ragebot.PendingRedirect = {
+                    Start = start,
+                    Direction = (position - start).Unit,
+                    Time = Workspace:GetServerTimeNow(),
+                    Player = target.Player,
+                    ObjectSpacePos = target.RootPart.CFrame:PointToObjectSpace(position),
+                    Headshot = part.Name == "Head",
+                }
+                Ragebot.Redirects = (Ragebot.Redirects or 0) + 1
+                return oldShoot(self, start, Ragebot.PendingRedirect.Direction, params)
+            end
+        end
+
+        return oldShoot(self, start, dir, params)
+    end))
+
+    -- 2) Inject Target / TargetPos / Direction / Spread into the networked Shoot action.
+    task.spawn(function()
+        local weapon
+        for _ = 1, 60 do
+            local ok, w = pcall(combat.GetCurrentWeapon)
+            if ok and w then weapon = w break end
+            task.wait(0.1)
+        end
+        if not weapon or not weapon.InvokeAction then return end
+
+        local oldInvoke
+        oldInvoke = hookfunction(weapon.InvokeAction, newcclosure(function(self, actionName, params, ...)
+            local pending = Ragebot.PendingRedirect
+            local matches = actionName == shootAction and pending
+                and (Workspace:GetServerTimeNow() - pending.Time < 0.5)
+                and type(params) == "table" and typeof(params.Start) == "Vector3"
+                and (params.Start - pending.Start).Magnitude < 5
+
+            if matches then
+                params.Direction = pending.Direction
+                params.Spread = 0
+                if pending.Player and pending.ObjectSpacePos then
+                    params.Target = pending.Player
+                    params.TargetPos = pending.ObjectSpacePos
+                    params.TargetHeadshot = pending.Headshot or false
+                end
+                Ragebot.Injects = (Ragebot.Injects or 0) + 1
+                Ragebot.PendingRedirect = nil
+            end
+
+            return oldInvoke(self, actionName, params, ...)
+        end))
+        Log("action hook installed")
+    end)
+
+    Ragebot.HooksInstalled = true
+    Log("fire hooks installed (silent aim active)")
+end
+
+-- Ragebot: pick the closest enemy, resolve the aim point, lock the camera onto it, and fire on
+-- cooldown. The Shoot hook still redirects + injects Target/TargetPos for precise server-side hit reg.
+function Ragebot.Step()
+    if not Ready or not Config.Ragebot or not Alive() then return end
+    if not IsGaming() then Ragebot.CurrentTarget = nil return end   -- only fight during a live round
+    if Ragebot.WhiffThisGame then return end        -- intentionally do nothing this game
+
+    local enemies = GatherEnemies()
+    if Config.WallCheck then RefreshRayFilter(enemies) end
+
+    -- Pathfinding chases the nearest enemy regardless of walls (so we walk toward line of sight);
+    -- firing only targets one we can actually see.
+    Ragebot.CurrentTarget = GetNearestEnemy()
+
+    local target = SelectTarget(enemies, Camera.CFrame.Position)
+    if not target then return end
+
+    -- Resolve the aim point (visible body point -> reprojected true pos + lead).
+    local _, aimPos = PickPoint(target, Camera.CFrame.Position)
+    if not aimPos then return end
+    -- The smooth camlock (below) tracks the target continuously; the silent-aim hook still redirects
+    -- the actual shot precisely, so hit reg doesn't depend on the camera being pixel-perfect.
+
+    local combat = CombatService()
+    local shootMod = ShootComponent()
+    if not combat or not shootMod then return end
+
+    local ok, weapon = pcall(combat.GetCurrentWeapon)
+    if not ok or not weapon then return end
+
+    local shootOk, shootable = pcall(shootMod.from, shootMod, weapon, "Shootable")
+    if not shootOk or not shootable then return end
+
+    -- Fire ONLY when the weapon itself says it's ready — this is the game's own rate/bolt-cycle gate,
+    -- so we fire exactly at the weapon's cadence instead of dry-firing between shots (the "spam").
+    local nowOk, canNow = pcall(shootable.CanShootNow, shootable)
+    if not nowOk or not canNow then return end
+
+    local ammoOk, canShoot = pcall(shootable.CanShoot, shootable)
+    if ammoOk and canShoot == false then return end   -- out of ammo / can't attack (let it reload)
+
+    Ragebot.LastShot = Workspace:GetServerTimeNow()
+    local cam = Camera.CFrame
+    pcall(shootable.Shoot, shootable, cam.Position, cam.LookVector, nil)
+end
+
+RunService.Heartbeat:Connect(function()
+    SafeCall("ragebot.step", Ragebot.Step)
+end)
+
+--=====================================================================
+-- Smooth camlock  (tracks the target's head with lerp + jitter so it doesn't read as a hard snap)
+--=====================================================================
+-- Head world position of a target character (real Head part, or ~1.5 studs above the root as R6/rig
+-- fallback), reprojected onto the true server position.
+local function TargetHeadPos(target)
+    local root = target:FindFirstChild("HumanoidRootPart")
+    local head = target:FindFirstChild("Head")
+    local base = head and head.Position or (root and (root.Position + Vector3.new(0, 1.5, 0)))
+    if not base then return nil end
+    local plr = Players:GetPlayerFromCharacter(target)
+    return Resolver.ReprojectPoint(plr, root, base)
+end
+
+local function StepCamlock()
+    if not Config.CameraLock or not Ready or not Alive() or not IsGaming() then return end
+    if Ragebot.WhiffThisGame then return end
+
+    local target = Ragebot.CurrentTarget
+    if not target then return end
+
+    local aimPos = TargetHeadPos(target)
+    if not aimPos then return end
+
+    -- Small per-frame jitter so it's never pixel-locked.
+    local j = Config.CamJitter
+    if j > 0 then
+        aimPos = aimPos + Vector3.new((math.random() * 2 - 1) * j, (math.random() * 2 - 1) * j, (math.random() * 2 - 1) * j)
+    end
+
+    local camPos = Camera.CFrame.Position
+    if (aimPos - camPos).Magnitude < 1e-3 then return end
+
+    -- Yaw locks straight onto the target 24/7 (horizontal is always on); pitch eases in smoothly so
+    -- the vertical movement still looks human rather than a hard vertical snap.
+    local goalPitch, goalYaw = CFrame.lookAt(camPos, aimPos):ToOrientation()
+    local curPitch = select(1, Camera.CFrame:ToOrientation())
+    local newPitch = curPitch + (goalPitch - curPitch) * math.clamp(Config.CamSmooth, 0.01, 1)
+
+    Camera.CFrame = CFrame.new(camPos) * CFrame.fromOrientation(newPitch, goalYaw, 0)
+end
+
+RunService.RenderStepped:Connect(function()
+    SafeCall("camlock", StepCamlock)
+end)
+
+--=====================================================================
+-- Pathfinding (walk to current target with PathfindingService)
+--=====================================================================
+local Pather = { Path = nil, Index = 1, LastCompute = 0 }
+
+-- Path visualization: client-side neon balls at each waypoint (blue = walk, orange = jump).
+local PathViz = { Parts = {}, Folder = nil }
+
+local function ClearPathViz()
+    for i = 1, #PathViz.Parts do
+        pcall(function() PathViz.Parts[i]:Destroy() end)
+    end
+    table.clear(PathViz.Parts)
+end
+
+local function RenderPath(waypoints)
+    ClearPathViz()
+    if not Config.VisualizePath or not waypoints then return end
+
+    if not (PathViz.Folder and PathViz.Folder.Parent) then
+        local f = Instance.new("Folder")
+        f.Name = "FarmPathViz"
+        f.Parent = Workspace
+        PathViz.Folder = f
+    end
+
+    for i = 1, #waypoints do
+        local wp = waypoints[i]
+        local part = Instance.new("Part")
+        part.Shape = Enum.PartType.Ball
+        part.Size = Vector3.new(0.6, 0.6, 0.6)
+        part.Position = wp.Position
+        part.Anchored = true
+        part.CanCollide = false
+        part.CanQuery = false
+        part.Material = Enum.Material.Neon
+        part.Color = (wp.Action == Enum.PathWaypointAction.Jump) and Color3.fromRGB(255, 170, 0) or Color3.fromRGB(0, 200, 255)
+        part.Transparency = 0.3
+        part.Parent = PathViz.Folder
+        PathViz.Parts[#PathViz.Parts + 1] = part
+    end
+end
+
+local function WalkToward(targetPos)
+    local char = LocalCharacter()
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = LocalRoot()
+    if not hum or not root then return end
+
+    -- Recompute the path periodically.
+    if os.clock() - Pather.LastCompute > 0.6 then
+        Pather.LastCompute = os.clock()
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 3,
+            AgentHeight = 5,
+            AgentCanJump = true,
+        })
+        local ok = pcall(path.ComputeAsync, path, root.Position, targetPos)
+        if ok and path.Status == Enum.PathStatus.Success then
+            Pather.Path = path:GetWaypoints()
+            Pather.Index = 1
+            RenderPath(Pather.Path)
+        else
+            -- No navmesh path (common on custom Roblox maps). Fall back to a straight line toward the
+            -- target so we still move AND still show a path — sampled points between us and them.
+            if not Pather.LoggedNoPath then
+                Pather.LoggedNoPath = true
+                Log("pathfind:", ok and tostring(path.Status) or "ComputeAsync error", "- using straight-line fallback")
+            end
+            local waypoints = {}
+            local segments = math.clamp(math.floor((targetPos - root.Position).Magnitude / 6), 1, 24)
+            for i = 1, segments do
+                waypoints[i] = { Position = root.Position:Lerp(targetPos, i / segments), Action = Enum.PathWaypointAction.Walk }
+            end
+            Pather.Path = waypoints
+            Pather.Index = 1
+            RenderPath(waypoints)
+        end
+    end
+
+    if Pather.Path and Pather.Path[Pather.Index] then
+        local wp = Pather.Path[Pather.Index]
+        hum:MoveTo(wp.Position)
+        if wp.Action == Enum.PathWaypointAction.Jump then
+            hum.Jump = true
+        end
+        if ((root.Position - wp.Position) * Vector3.new(1, 0, 1)).Magnitude < 4 then
+            Pather.Index += 1
+        end
+    else
+        hum:MoveTo(targetPos)
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if not Ready or not Config.Pathfind or not Alive() then return end
+    if not IsGaming() then if #PathViz.Parts > 0 then ClearPathViz() end return end
+    local target = Ragebot.CurrentTarget
+    if target and EnemyAlive(target) then
+        local root = target:FindFirstChild("HumanoidRootPart")
+        if root then
+            SafeCall("pathfind.walk", WalkToward, root.Position)
+        end
+    elseif #PathViz.Parts > 0 then
+        ClearPathViz()
+    end
+end)
+
+--=====================================================================
+-- Forced walkspeed  (MoveTo cancels the game's Sprint state, so we force speed directly)
+--=====================================================================
+-- The game constantly resets WalkSpeed, so instead of polling we listen on its changed signal and
+-- snap it back the instant the game touches it. Setting it only when it differs means the write we
+-- make re-fires the signal once, sees it already matches, and stops — no infinite loop.
+local function ApplyWalkSpeed(hum)
+    if Config.WalkSpeed > 0 and hum.WalkSpeed ~= Config.WalkSpeed then
+        hum.WalkSpeed = Config.WalkSpeed
+    end
+end
+
+local function HookWalkSpeed(char)
+    local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    ApplyWalkSpeed(hum)
+    hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if Alive() then ApplyWalkSpeed(hum) end
+    end)
+end
+
+if LocalPlayer.Character then task.spawn(HookWalkSpeed, LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.spawn(HookWalkSpeed, char)
+end)
+
+--=====================================================================
+-- Stats readers (rank / kills / level / coins / net worth)
+--=====================================================================
+-- All of these come straight from the game's own client stores, the exact same ones the
+-- Statistics / net-worth UI reads:
+--   * StatusService.GetStatus(key)          -> coins, level, net worth, lifetime cases, mystic count
+--     (safe to call any time: returns 0 before the store inits, never yields)
+--   * StatsService.LocalStatsStore:GetStat(statKey, scope)  -> lifetime kills / headshots / deaths / W/L
+--   * RankedService.GetRating(mode)          -> ranked rating + tier index (Duel = ranked 1v1)
+--     RankingConfig.Tiers[tier].Display      -> "Gold II", "Master", ... (nil tier = Unranked)
+-- These are literal keys, not module lookups: the game builds them via k2v, so every value equals
+-- its own name (Stat.Kill == "Kill", Status.Level == "Level", ...). Using the strings directly means
+-- we never dot-index a not-yet-replicated Constant module at load time (which hard-errors the script).
+local StatKey       = { Kill="Kill", HeadshotKill="HeadshotKill", Death="Death", Win="Win", Lose="Lose" }
+local StatusKey     = { Level="Level", Eco_Coin="Eco_Coin", NetWorth="NetWorth", WeaponValue="WeaponValue", Gachaed="Gachaed", MysticWeaponCount="MysticWeaponCount" }
+local RankedModeKey = { Duel="Duel", Arcade="Arcade" }
+
+-- Safe child resolve so a missing/late remote returns nil instead of throwing on dot-index.
+local function ResolveRemote(name)
+    local remote = ReplicatedStorage:FindFirstChild("Remote")
+    return remote and remote:FindFirstChild(name)
+end
+
+local function StatusSvc()  return GetSvc("Status", ResolveRemote("StatusService"), { "GetStatus", "SetStatus", "AddStatus" }) end
+local function StatsSvc()   return GetSvc("Stats",  ResolveRemote("StatsService"),  { "LocalStatsStore", "WaitInit", "OnInit" }) end
+local function RankedSvc()  return GetSvc("Ranked", ResolveRemote("RankedService"), { "GetRating", "GetModeData", "ClaimReward" }) end
+local RankingConfig
+
+-- Group digits with commas: 56800 -> "56,800".
+local function Comma(n)
+    if type(n) ~= "number" then return tostring(n) end
+    local s = string.format("%d", math.floor(n))
+    local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    return (out:gsub("^,", ""))
+end
+
+local function GetStatus(key)
+    local svc = StatusSvc()
+    if not svc or not svc.GetStatus or not key then return 0 end
+    local ok, v = pcall(svc.GetStatus, key)
+    return (ok and type(v) == "number") and v or 0
+end
+
+local function GetStat(key, scope)
+    local svc = StatsSvc()
+    local store = svc and svc.LocalStatsStore
+    if not store or not store.Data or not key then return 0 end
+    local ok, v = pcall(store.GetStat, store, key, scope)  -- method call: (self, key, scope)
+    return (ok and type(v) == "number") and v or 0
+end
+
+local function GetCoins()
+    return GetStatus(StatusKey.Eco_Coin)
+end
+
+-- Net worth as the game tracks it; falls back to the inventory value status.
+local function GetNetWorth()
+    local nw = GetStatus(StatusKey.NetWorth)
+    if nw > 0 then return nw end
+    return GetStatus(StatusKey.WeaponValue)
+end
+
+-- "Gold II (1234)" style rank string for ranked 1v1 (Duel). nil if we can't read it yet.
+local function GetRankString()
+    local svc = RankedSvc()
+    if not svc or not svc.GetRating then return nil end
+
+    local ok, rating, tier = pcall(svc.GetRating, RankedModeKey.Duel)
+    if not ok then return nil end
+
+    RankingConfig = RankingConfig or ResolveModule(SafeChild(ReplicatedStorage, "Config", "RankingConfig"), { "Tiers", "GetSeasonConfig" })
+    local info = RankingConfig and RankingConfig.Tiers and tier and RankingConfig.Tiers[tier]
+    local display = (info and info.Display) or "Unranked"
+
+    return string.format("%s (%s)", display, Comma(rating or 0))
+end
+
+--=====================================================================
+-- Auto Sell  (SAFE: only Common/UnCommon/Rare/Epic, always via CanSell)
+--=====================================================================
+local function DoAutoSell()
+    if not Config.AutoSell then return end
+    local weapon = WeaponService()
+    local wdh = WeaponDataHelper()
+    if not weapon or not wdh then return end
+
+    local content = weapon.GetContent and weapon.GetContent()
+    if type(content) ~= "table" then return end
+
+    local toSell = {}
+    for uid, data in pairs(content) do
+        local cfgOk, cfg = pcall(wdh.GetConfig, data)
+        -- Effective rarity = SecondaryRarity (the SKIN's rarity) or Rarity (base gun) — exactly how the
+        -- game's own GetRaritySortOrder resolves it. Reading only .Rarity meant only the SSG base gun
+        -- (Rarity=Common) matched; every skin's rarity is on .SecondaryRarity.
+        local rarity = cfgOk and cfg and (cfg.SecondaryRarity or cfg.Rarity)
+        if rarity and SellRarities[rarity] then
+            local sellOk, can = pcall(weapon.CanSell, data)
+            if sellOk and can then
+                toSell[#toSell + 1] = uid
+            end
+        end
+    end
+
+    if #toSell == 0 then return end
+
+    -- Sell in modest batches.
+    for i = 1, #toSell, 40 do
+        if not Alive() then return end
+        local batch = {}
+        for j = i, math.min(i + 39, #toSell) do
+            batch[#batch + 1] = toSell[j]
+        end
+        pcall(weapon.Sell, batch)
+        Session.ItemsSold += #batch
+        task.wait(0.5)
+    end
+    Log("sold", #toSell, "junk skins")
+end
+
+--=====================================================================
+-- Auto Buy + Open Case
+--=====================================================================
+-- ShopService.Purchase is a RemoteFunction: InvokeServer("<Product>_x<n>", n). Confirmed via spy:
+--   Remote.ShopService.Purchase:InvokeServer("StrikeCase_Premium_x1", 1)
+local function BuyCase()
+    if not Config.AutoBuyCase then return end
+
+    -- Optional reserve guard (only if we can read coins).
+    if Config.CaseKeepCoins > 0 then
+        local coins = GetCoins()
+        if coins and coins <= Config.CaseKeepCoins then return end
+    end
+
+    local shop = ReplicatedStorage:FindFirstChild("Remote")
+    shop = shop and shop:FindFirstChild("ShopService")
+    local purchase = shop and shop:FindFirstChild("Purchase")
+    if not purchase then return end
+
+    -- Server validates affordability/eligibility; a rejection is harmless.
+    pcall(function()
+        return purchase:InvokeServer(Config.BuyProduct, 1)
+    end)
+end
+
+local function DoBuyAndOpenCase()
+    BuyCase()
+
+    -- Open however many of the case we own (direct gacha remote = instant, no animation).
+    if Config.AutoOpenCase then
+        local gacha = GachaService()
+        if gacha and gacha.GetGachaCount then
+            local ownOk, owned = pcall(gacha.GetGachaCount, Config.CaseKey)
+            if ownOk and type(owned) == "number" and owned > 0 then
+                local amount = math.min(owned, 10)
+                local openOk = pcall(gacha.Gacha, Config.CaseKey, amount)
+                if openOk then
+                    Session.CasesOpened += amount
+                    Log("opened", amount, Config.CaseKey)
+                end
+            end
+        end
+    end
+end
+
+-- Insta-skip: enable the game's SkipGachaAnim setting so any opening is instant. (Opening via the
+-- gacha remote is already instant, but this covers the UI path and any client-side open lock.)
+local function ApplyInstaSkip()
+    if not Config.InstaSkip then return end
+    local settingSvc = ResolveModule(SafeChild(ReplicatedStorage, "Remote", "SettingService"), { "Settings" })
+    local setting = settingSvc and settingSvc.Settings and settingSvc.Settings.SkipGachaAnim
+    if setting then
+        pcall(function() setting.Value = true end)
+    end
+end
+
+--=====================================================================
+-- Auto Equip most valuable glove / knife / gun (SSG)
+--=====================================================================
+-- Picks the highest-Rap owned item of each slot and equips it. Non-destructive.
+local function DoAutoEquip()
+    if not Config.AutoEquip then return end
+    local weapon = WeaponService()
+    local equip = EquipmentService()
+    local wdh = WeaponDataHelper()
+    if not weapon or not equip or not wdh then return end
+
+    local content = weapon.GetContent and weapon.GetContent()
+    if type(content) ~= "table" then return end
+
+    -- Bucket by weapon family/base name; find the highest-priced variant we own per family.
+    local best = {}   -- baseName -> { uid, price }
+    for uid, data in pairs(content) do
+        local cfgOk, cfg = pcall(wdh.GetConfig, data)
+        local nameOk, name = pcall(wdh.Name, data)
+        if cfgOk and cfg and nameOk and name then
+            local base = tostring(name):match("^([^.]+)") or name
+            local priceOk, price = pcall(wdh.Price, data)
+            price = (priceOk and type(price) == "number") and price or 0
+            if not best[base] or price > best[base].price then
+                best[base] = { uid = uid, price = price, data = data }
+            end
+        end
+    end
+
+    -- Equip the best of each. SetEquip signature is (uid / weaponKey, ...) — try the common shape.
+    for _, entry in pairs(best) do
+        pcall(equip.SetEquip, entry.uid)
+    end
+end
+
+--=====================================================================
+-- Auto Claim free rewards (mailbox + battlepass)
+--=====================================================================
+local function DoAutoClaim()
+    if not Config.AutoClaim then return end
+
+    local mail = Mailbox()
+    if mail and mail.GetAll then
+        local ok, list = pcall(mail.GetAll)
+        if ok and type(list) == "table" then
+            for _, item in pairs(list) do
+                local id = type(item) == "table" and (item.Id or item.id or item.Key) or item
+                if id then pcall(mail.Claim, id) end
+            end
+        end
+    end
+
+    local bp = Battlepass()
+    if bp then
+        pcall(function() bp.ClaimPremiumReward() end)
+        pcall(function() bp.ClaimRebirthReward() end)
+    end
+end
+
+--=====================================================================
+-- Auto Requeue ranked
+--=====================================================================
+-- We're "in a match" once we've joined a game client (covers pre-round vote + the live round);
+-- queueing again during that window would be wrong.
+local function InMatch()
+    return IsJoined()
+end
+
+-- Resolve the ranked 1v1 queue key from the game's own matchmaking config (Ranked + TeamSize 1),
+-- so we don't depend on a decompiler-mangled string. Cached after first lookup.
+local ResolvedQueue = nil
+local function GetRankedQueue()
+    if Config.RankedQueue then return Config.RankedQueue end
+    if ResolvedQueue then return ResolvedQueue end
+
+    local mmConfig = ResolveModule(SafeChild(ReplicatedStorage, "Config", "Config", "Matchmaking"), { "Queues" })
+    if mmConfig and type(mmConfig.Queues) == "table" then
+        for name, q in pairs(mmConfig.Queues) do
+            if q.Ranked and (q.TeamSize == 1 or q.Players == 2) then
+                ResolvedQueue = q.Name or name
+                return ResolvedQueue
+            end
+        end
+    end
+    return nil
+end
+
+local function TryQueue()
+    if not Config.AutoRequeue then return end
+    local mm = Matchmaking()
+    if not mm then return end
+    if mm.Matching then return end          -- already in queue
+    if InMatch() then return end            -- still in a match / scoreboard
+
+    local queue = GetRankedQueue()
+    if not queue then return end
+
+    -- Match() can yield waiting on the _Ready flag; spawn it so it never stalls the lifecycle loop.
+    task.spawn(function()
+        local ok, res = pcall(mm.Match, queue)   -- Match(key): field fn, no self
+        Log("queue ->", queue, ok and ("res=" .. tostring(res)) or "call failed")
+    end)
+end
+
+--=====================================================================
+-- K/D normalizer  (throw ~LossRate of games)
+--=====================================================================
+local function RollGame()
+    if not Config.KDNormalizer then
+        Ragebot.WhiffThisGame = false
+        return
+    end
+    Ragebot.WhiffThisGame = math.random() < Config.LossRate
+    if Ragebot.WhiffThisGame then
+        Log("K/D normalizer: throwing this game")
+    end
+end
+
+-- Roll per match: decide when a round actually goes live (IsGaming rising edge), not merely on join.
+task.spawn(function()
+    local was = false
+    while Alive() do
+        local now = IsGaming()
+        if now and not was then
+            RollGame()
+        end
+        was = now
+        task.wait(1)
+    end
+end)
+
+--=====================================================================
+-- Webhook report
+--=====================================================================
+local function BuildEmbed()
+    local rank        = GetRankString()
+    local level       = GetStatus(StatusKey.Level)
+    local coins       = GetCoins()
+    local networth    = GetNetWorth()
+    local mystic      = GetStatus(StatusKey.MysticWeaponCount)
+    local lifeCases   = GetStatus(StatusKey.Gachaed)
+
+    local kills       = GetStat(StatKey.Kill)
+    local headshots   = GetStat(StatKey.HeadshotKill)
+    local deaths      = GetStat(StatKey.Death)
+    local wins        = GetStat(StatKey.Win)
+    local losses      = GetStat(StatKey.Lose)
+    local kd          = deaths > 0 and string.format("%.2f", kills / deaths) or tostring(kills)
+
+    local fields = {
+        { name = "Uptime",        value = FormatDuration(Uptime()),                 inline = true },
+        { name = "Rank (1v1)",    value = rank or "Unranked",                       inline = true },
+        { name = "Level",         value = Comma(level),                             inline = true },
+        { name = "Coins",         value = Comma(coins),                             inline = true },
+        { name = "Net Worth",     value = Comma(networth),                          inline = true },
+        { name = "Mystic Items",  value = Comma(mystic),                            inline = true },
+        { name = "Kills / Deaths", value = string.format("%s / %s", Comma(kills), Comma(deaths)), inline = true },
+        { name = "K/D",           value = kd,                                       inline = true },
+        { name = "Headshots",     value = Comma(headshots),                         inline = true },
+        { name = "Wins / Losses", value = string.format("%s / %s", Comma(wins), Comma(losses)), inline = true },
+        { name = "Cases (session)", value = string.format("%s (%s lifetime)", Comma(Session.CasesOpened), Comma(lifeCases)), inline = true },
+        { name = "Sold (session)", value = Comma(Session.ItemsSold),                inline = true },
+    }
+
+    return {
+        username = "Sniper Arena Farm",
+        embeds = {{
+            title = "Farm Report",
+            color = 8067327,
+            fields = fields,
+            footer = { text = "farm.lua • " .. os.date("%Y-%m-%d %H:%M:%S") },
+        }},
+    }
+end
+
+local function SendReport()
+    if webhookUrl == "" or webhookUrl == "PUT_YOUR_DISCORD_WEBHOOK_URL_HERE" then return end
+    local ok, body = pcall(HttpService.JSONEncode, HttpService, BuildEmbed())
+    if ok then
+        HttpPost(webhookUrl, body)
+    end
+end
+
+--=====================================================================
+-- Main loops
+--=====================================================================
+-- Everything waits for WaitForGameReady() first, and each heavy action goes through Throttled()
+-- so a single pass is spread out over ~7-8s instead of firing five remotes in one frame.
+task.spawn(function()
+    WaitForGameReady()
+
+    pcall(ApplyInstaSkip)
+
+    -- Keep trying to install the silent-aim hooks until the combat modules are resolvable (they may
+    -- not exist in the GC until we're actually in a round with a weapon). Stops once installed.
+    task.spawn(function()
+        while Alive() and not Ragebot.HooksInstalled do
+            SafeCall("installhooks", InstallFireHooks)
+            task.wait(2)
+        end
+    end)
+
+    -- Heavy actions loop (buy/open, sell, equip, claim) — one at a time, spaced out. Requeue is NOT
+    -- here: it must be fast, not stuck behind seconds of throttled shop/inventory work.
+    task.spawn(function()
+        while Alive() do
+            Throttled(DoBuyAndOpenCase)
+            Throttled(DoAutoSell)
+            Throttled(DoAutoEquip)
+            Throttled(DoAutoClaim)
+            task.wait(Config.LoopInterval)
+        end
+    end)
+
+    -- Fast lifecycle loop (1s): everything that gets us into the next match ASAP —
+    -- rematch off the endgame screen, requeue from the lobby, and ban/vote maps. All idempotent.
+    task.spawn(function()
+        while Alive() do
+            SafeCall("playagain", PlayAgain)      -- endgame screen -> requeue same ranked queue
+            SafeCall("tryqueue", TryQueue)        -- lobby -> queue ranked 1v1
+            SafeCall("mapphase", AutoMapPhase)    -- ban then vote so the round starts
+            task.wait(1)
+        end
+    end)
+
+    -- Debug state readout so we can see exactly which gate is blocking (turn off via Config.Debug).
+    task.spawn(function()
+        while Alive() do
+            if Config.Debug then
+                local room = GetFocusedRoom()
+                local state = room and select(2, pcall(function() return room:GetState() end)) or "no-room"
+                Log(("DBG target=%s hooks=%s fires=%d filter=%d redirects=%d injects=%d"):format(
+                    tostring(Ragebot.CurrentTarget ~= nil), tostring(Ragebot.HooksInstalled),
+                    Ragebot.HookFires or 0, Ragebot.FilterPass or 0, Ragebot.Redirects or 0, Ragebot.Injects or 0))
+            end
+            task.wait(3)
+        end
+    end)
+
+    -- Webhook reporter loop.
+    task.spawn(function()
+        SendReport() -- one at startup so you know it's alive
+        while Alive() do
+            task.wait(Config.ReportEvery)
+            SendReport()
+        end
+    end)
+
+    -- Count deaths from our own humanoid for the session stats.
+    task.spawn(function()
+        while Alive() do
+            local char = LocalCharacter()
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.Died:Once(function()
+                    Session.Deaths += 1
+                end)
+            end
+            task.wait(3)
+        end
+    end)
+end)
+
+Log("farm loaded — waiting for game to be ready…")
