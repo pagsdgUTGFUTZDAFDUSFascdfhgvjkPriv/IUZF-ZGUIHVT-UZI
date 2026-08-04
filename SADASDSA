@@ -17,7 +17,7 @@
 --=====================================================================
 
 -- CONFIG ---------------------------------------------------------------
-local webhookUrl = "https://discord.com/api/webhooks/1534239420285325432/FB0ALduuUxKv4Q7IUH5APoGFPHoaWHy24f9oQsooEumnbinXWHx2QI_H4eAiQTTzQz52"
+local webhookUrl = "https://discord.com/api/webhooks/1534306267269562469/-8oot-f7WlDBLxXwWFjApcO6e-qxIIxvZh7gZz4C2oBZbwj-itMrwAi9l1ejUp-mJPeK"
 
 local Config = {
     RankedQueue   = nil,           -- nil = auto-resolve the ranked 1v1 queue from the game config
