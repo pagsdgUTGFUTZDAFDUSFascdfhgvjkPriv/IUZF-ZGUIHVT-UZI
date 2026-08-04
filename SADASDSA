@@ -1,3 +1,21 @@
+--=====================================================================
+-- Sniper Arena — Overnight Ranked Farm (autoexec)
+--=====================================================================
+-- Put this in autoexec and leave it. It:
+--   * ranked-queues, plays with a built-in ragebot (pathfinds to targets),
+--   * normalizes K/D so you don't sit at a 100% winrate (loses ~3% on purpose),
+--   * auto-buys + opens the [Strike] Mystic Case with coins,
+--   * auto-sells Common/UnCommon/Rare/Epic skins (never Legendary+, never locked/favorited),
+--   * auto-equips your most valuable glove / knife / gun (SSG),
+--   * auto-claims free case sources (mailbox, battlepass),
+--   * reports rank / stats / net worth / kills / level to a Discord webhook every 30 min,
+--   * tracks uptime in getgenv so a re-exec doesn't reset the session.
+--
+-- SAFETY: auto-sell only ever touches Common/UnCommon/Rare/Epic AND respects the game's own
+-- CanSell (which blocks locked, favorited, starter, unsellable and Exotic+ items). It can never
+-- sell a Legendary/Mystic/Exotic/Secret. Leave AutoSell off on your first run and watch the log.
+--=====================================================================
+
 -- CONFIG ---------------------------------------------------------------
 local webhookUrl = "https://discord.com/api/webhooks/1534239420285325432/FB0ALduuUxKv4Q7IUH5APoGFPHoaWHy24f9oQsooEumnbinXWHx2QI_H4eAiQTTzQz52"
 
@@ -69,7 +87,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-04-r15"
+local FARM_VERSION = "2026-08-04-r17"
 
 local function Log(...)
     print("[farm]", ...)
@@ -175,25 +193,39 @@ end
 -- getgenv uptime (survives re-exec)
 --=====================================================================
 local Session = getgenv().__FarmSession
+
+-- Disconnect the PREVIOUS instance's live connections so re-executing doesn't stack ragebot/camlock/
+-- pathfind loops on top of each other (that stacking = lag + duplicate webhooks).
+if Session and Session.Connections then
+    for i = 1, #Session.Connections do pcall(function() Session.Connections[i]:Disconnect() end) end
+end
+
 if not Session then
     Session = {
-        StartClock = os.clock(),
-        StartTime  = os.time(),
+        StartTime  = os.time(),      -- set ONCE; survives re-exec so uptime keeps counting
         Kills = 0, Deaths = 0,
         Wins = 0, Losses = 0,
         CasesOpened = 0, ItemsSold = 0, CoinsFromSells = 0,
+        LastReport = 0,              -- shared webhook debounce timestamp
         Running = true,
         Version = 0,
     }
     getgenv().__FarmSession = Session
-else
-    Session.Running = true
 end
-Session.Version += 1
+Session.Running = true
+Session.Connections = {}
+Session.Version = (Session.Version or 0) + 1
 local MyVersion = Session.Version   -- lets an older copy of the script bow out if re-executed
 
 local function Alive()
     return Session.Running and Session.Version == MyVersion
+end
+
+-- Track every connection on the session so the next exec can tear them down.
+local function Connect(signal, fn)
+    local c = signal:Connect(fn)
+    Session.Connections[#Session.Connections + 1] = c
+    return c
 end
 
 local function Uptime()
@@ -727,6 +759,18 @@ local function InstallFireHooks()
 
     local shootAction = shootMod.Action and shootMod.Action.Shoot
 
+    -- Resolve the PitchYaw network query — invoking it replicates our aim (pitch+yaw) to the server,
+    -- which the server validates the shot against. Without setting it to the target on each shot the
+    -- server sees us aimed elsewhere and the hit misses. (Skeet: EntityService.Common.Network...)
+    for _, getter in ipairs({
+        function() return entitySvc.Common.Network.Packets.queries.PitchYaw end,
+        function() return entitySvc.Common.Network.queries.PitchYaw end,
+    }) do
+        local ok, q = pcall(getter)
+        if ok and type(q) == "table" and q.invoke then Ragebot.PitchYawQuery = q break end
+    end
+    if Config.Debug then Log("PitchYaw query: " .. tostring(Ragebot.PitchYawQuery ~= nil)) end
+
     -- 1) Redirect OUR shots at the resolved target, and stash the redirect for the action hook.
     local oldShoot
     oldShoot = hookfunction(shootMod.Shoot, newcclosure(function(self, start, dir, params)
@@ -763,6 +807,15 @@ local function InstallFireHooks()
                     Headshot = part.Name == "Head",
                 }
                 Ragebot.Redirects = (Ragebot.Redirects or 0) + 1
+
+                -- On-shot: replicate our pitch/yaw pointing straight at the hit position, so the
+                -- server's aim check agrees the shot was aimed at the target. THIS is the piece that
+                -- was making shots miss server-side.
+                if Ragebot.PitchYawQuery then
+                    local pitch, yaw = CFrame.lookAt(start, position):ToOrientation()
+                    pcall(Ragebot.PitchYawQuery.invoke, { Pitch = pitch, Yaw = yaw })
+                end
+
                 return oldShoot(self, start, Ragebot.PendingRedirect.Direction, params)
             end
         end
@@ -855,7 +908,7 @@ function Ragebot.Step()
     pcall(shootable.Shoot, shootable, cam.Position, cam.LookVector, nil)
 end
 
-RunService.Heartbeat:Connect(function()
+Connect(RunService.Heartbeat, function()
     SafeCall("ragebot.step", Ragebot.Step)
 end)
 
@@ -901,7 +954,7 @@ local function StepCamlock()
     Camera.CFrame = CFrame.new(camPos) * CFrame.fromOrientation(newPitch, goalYaw, 0)
 end
 
-RunService.RenderStepped:Connect(function()
+Connect(RunService.RenderStepped, function()
     SafeCall("camlock", StepCamlock)
 end)
 
@@ -999,7 +1052,7 @@ local function WalkToward(targetPos)
     end
 end
 
-RunService.Heartbeat:Connect(function()
+Connect(RunService.Heartbeat, function()
     if not Ready or not Config.Pathfind or not Alive() then return end
     if not IsGaming() then if #PathViz.Parts > 0 then ClearPathViz() end return end
     local target = Ragebot.CurrentTarget
@@ -1029,13 +1082,13 @@ local function HookWalkSpeed(char)
     local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
     if not hum then return end
     ApplyWalkSpeed(hum)
-    hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+    Connect(hum:GetPropertyChangedSignal("WalkSpeed"), function()
         if Alive() then ApplyWalkSpeed(hum) end
     end)
 end
 
 if LocalPlayer.Character then task.spawn(HookWalkSpeed, LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(function(char)
+Connect(LocalPlayer.CharacterAdded, function(char)
     task.spawn(HookWalkSpeed, char)
 end)
 
@@ -1390,8 +1443,14 @@ local function BuildEmbed()
     }
 end
 
-local function SendReport()
+local function SendReport(force)
     if webhookUrl == "" or webhookUrl == "PUT_YOUR_DISCORD_WEBHOOK_URL_HERE" then return end
+
+    -- Shared debounce so re-executing (or a lingering old instance) can't spam the webhook — at most
+    -- one report per ReportEvery across ALL instances. `force` bypasses it for a manual call.
+    if not force and os.time() - (Session.LastReport or 0) < Config.ReportEvery - 5 then return end
+    Session.LastReport = os.time()
+
     local ok, body = pcall(HttpService.JSONEncode, HttpService, BuildEmbed())
     if ok then
         HttpPost(webhookUrl, body)
