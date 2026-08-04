@@ -1,21 +1,3 @@
---=====================================================================
--- Sniper Arena — Overnight Ranked Farm (autoexec)
---=====================================================================
--- Put this in autoexec and leave it. It:
---   * ranked-queues, plays with a built-in ragebot (pathfinds to targets),
---   * normalizes K/D so you don't sit at a 100% winrate (loses ~3% on purpose),
---   * auto-buys + opens the [Strike] Mystic Case with coins,
---   * auto-sells Common/UnCommon/Rare/Epic skins (never Legendary+, never locked/favorited),
---   * auto-equips your most valuable glove / knife / gun (SSG),
---   * auto-claims free case sources (mailbox, battlepass),
---   * reports rank / stats / net worth / kills / level to a Discord webhook every 30 min,
---   * tracks uptime in getgenv so a re-exec doesn't reset the session.
---
--- SAFETY: auto-sell only ever touches Common/UnCommon/Rare/Epic AND respects the game's own
--- CanSell (which blocks locked, favorited, starter, unsellable and Exotic+ items). It can never
--- sell a Legendary/Mystic/Exotic/Secret. Leave AutoSell off on your first run and watch the log.
---=====================================================================
-
 -- CONFIG ---------------------------------------------------------------
 local webhookUrl = "https://discord.com/api/webhooks/1534239420285325432/FB0ALduuUxKv4Q7IUH5APoGFPHoaWHy24f9oQsooEumnbinXWHx2QI_H4eAiQTTzQz52"
 
