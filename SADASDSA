@@ -88,7 +88,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r2"
+local FARM_VERSION = "2026-08-05-beginner-r3"
 
 local function Log(...)
     print("[farm]", ...)
@@ -1639,6 +1639,19 @@ task.spawn(function()
         while Alive() and not Ragebot.HooksInstalled do
             SafeCall("installhooks", InstallFireHooks)
             task.wait(2)
+        end
+    end)
+
+    -- Report which kind of server we landed in (so each of the 8 accounts is easy to verify).
+    task.spawn(function()
+        local srv = ServerModule()
+        local mode = srv and select(2, pcall(srv.GetMode)) or "?"
+        local newbie = srv and select(2, pcall(srv.IsNewbie)) or false
+        if InBeginnerServer() then
+            Log(("BEGINNER SERVER — mode=%s newbie=%s (kills=%d/50 games=%d/2)"):format(
+                tostring(mode), tostring(newbie), BeginnerKills(), BeginnerGames()))
+        else
+            Log(("not a beginner server — mode=%s newbie=%s"):format(tostring(mode), tostring(newbie)))
         end
     end)
 
