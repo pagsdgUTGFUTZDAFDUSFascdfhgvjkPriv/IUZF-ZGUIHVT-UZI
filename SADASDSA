@@ -62,6 +62,14 @@ local Config = {
     ReportEvery   = 30 * 60,       -- webhook report interval (seconds)
 
     Debug         = true,          -- log state + surface swallowed errors (turn off once it's stable)
+
+    -- Where are we? (all one universe: 9534705677)
+    Universe      = 9534705677,
+    Places        = {
+        [119259569670784] = "beginner",   -- [Arcade][Beginner]
+        [122446657157717] = "lobby",
+        [90165746516953]  = "ranked",
+    },
 }
 
 local SellRarities = {
@@ -88,7 +96,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r4"
+local FARM_VERSION = "2026-08-05-beginner-r5"
 
 local function Log(...)
     print("[farm]", ...)
@@ -96,6 +104,15 @@ end
 
 -- Loud build banner: if you don't see THIS exact version in the console, you're running an old copy.
 warn("========== farm.lua BUILD " .. FARM_VERSION .. " ==========")
+
+-- Which Sniper Arena place are we in? Bail out entirely if this isn't one of ours.
+local Place = Config.Places[game.PlaceId]
+if not Place and game.GameId ~= Config.Universe then
+    warn(("[farm] not a Sniper Arena place (place=%d game=%d) — not loading"):format(game.PlaceId, game.GameId))
+    return
+end
+Place = Place or "unknown-sa"
+warn("[farm] place: " .. Place)
 
 -- pcall that surfaces the FIRST error per label (instead of silently swallowing it), so a broken
 -- gate is visible in the console instead of just "nothing happens".
