@@ -17,7 +17,7 @@
 --=====================================================================
 
 -- CONFIG ---------------------------------------------------------------
-local webhookUrl = "https://discord.com/api/webhooks/1534306267269562469/-8oot-f7WlDBLxXwWFjApcO6e-qxIIxvZh7gZz4C2oBZbwj-itMrwAi9l1ejUp-mJPeK"
+local webhookUrl = "https://discord.com/api/webhooks/1534239420285325432/FB0ALduuUxKv4Q7IUH5APoGFPHoaWHy24f9oQsooEumnbinXWHx2QI_H4eAiQTTzQz52"
 
 local Config = {
     RankedQueue   = nil,           -- nil = auto-resolve the ranked 1v1 queue from the game config
@@ -39,9 +39,10 @@ local Config = {
     CamSmooth     = 0.18,          -- 0..1 lerp per frame — lower = smoother/lazier (less sus)
     CamJitter     = 0.45,          -- studs of random jitter on the aim point so it's not pixel-locked
     Pathfind      = true,          -- walk to the current target with PathfindingService
-    WalkSpeed     = 26,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
+    WalkSpeed     = 22,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
                                    -- cancelled by MoveTo, so we just set speed directly instead.
     AutoRequeue   = true,
+    WaitForCases  = true,          -- don't requeue until every owned case has been opened
     BanMapName    = "Grid",        -- always ban this map if it's in the ban pool (nil = random ban)
 
     KDNormalizer  = true,
@@ -54,7 +55,7 @@ local Config = {
 
     AutoOpenCase  = true,
     InstaSkip     = true,          -- skip the case-opening animation
-    AutoSell      = false,         -- OFF by default — verify behaviour before trusting it overnight
+    AutoSell      = true,          -- sell Common/UnCommon/Rare/Epic (never locked/favorited/Legendary+)
     AutoEquip     = true,          -- equip most valuable glove / knife / SSG
     AutoClaim     = true,          -- mailbox + battlepass free rewards
 
@@ -87,7 +88,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-04-r17"
+local FARM_VERSION = "2026-08-04-r20"
 
 local function Log(...)
     print("[farm]", ...)
@@ -182,11 +183,11 @@ end
 -- Run a heavy action but never faster than Config.ActionGap since the last heavy action, so a full
 -- farm pass is spread out across time instead of slamming the client in one frame.
 local LastAction = 0
-local function Throttled(fn)
+local function Throttled(label, fn)
     local wait = Config.ActionGap - (os.clock() - LastAction)
     if wait > 0 then task.wait(wait) end
     LastAction = os.clock()
-    return pcall(fn)
+    return SafeCall(label, fn)   -- surfaces the first error per action instead of swallowing it
 end
 
 --=====================================================================
@@ -227,6 +228,10 @@ local function Connect(signal, fn)
     Session.Connections[#Session.Connections + 1] = c
     return c
 end
+
+-- Forward-declared: returns true while there are still unopened cases to open. Assigned later once
+-- GachaService/TotalUnopenedCases exist; PlayAgain/TryQueue (defined earlier) read it as an upvalue.
+local CasesPending
 
 local function Uptime()
     return os.time() - Session.StartTime
@@ -302,7 +307,9 @@ local function Matchmaking()     return GetSvc("Match",    SafeChild(ReplicatedS
 local function EquipmentService()return GetSvc("Equip",    SafeChild(ReplicatedStorage, "Remote", "EquipmentService"), { "SetEquip" }) end
 local function RapService()      return GetSvc("Rap",      SafeChild(ReplicatedStorage, "Remote", "WeaponRapService"), { "GetRap" }) end
 local function Mailbox()         return GetSvc("Mailbox",  SafeChild(ReplicatedStorage, "Remote", "MailboxService"), { "GetAll", "Claim" }) end
-local function Battlepass()      return GetSvc("Battlepass", SafeChild(ReplicatedStorage, "Remote", "BattlepassService"), { "ClaimPremiumReward" }) end
+local function Battlepass()      return GetSvc("Battlepass", SafeChild(ReplicatedStorage, "Remote", "BattlepassService"), { "Claim", "ClaimPremiumReward" }) end
+local function Minipass()         return GetSvc("Minipass",  SafeChild(ReplicatedStorage, "Remote", "MinipassService"), { "Claim", "ClaimPremiumReward" }) end
+local function QuestService()    return GetSvc("Quest",    SafeChild(ReplicatedStorage, "Remote", "QuestService"), { "ClaimReward", "IsFinished" }) end
 local function EntityService()   return GetSvc("Entity",   SafeChild(ReplicatedStorage, "Remote", "EntityService"), { "GetLocalEntity", "GetEntity", "FetchEntity" }) end
 local function WeaponDataHelper()return GetSvc("WDH",      SafeChild(ReplicatedStorage, "Common", "WeaponService", "WeaponDataHelper"), { "GetConfig", "Name", "Price", "WearFactor" }) end
 local function ShootComponent()  return GetSvc("Shoot",    SafeChild(ReplicatedStorage, "Common", "CombatService", "CommonComponent", "CommonShootableComponent"), { "Shoot", "GetSpread", "StartShooting", "Action" }) end
@@ -378,6 +385,7 @@ local LastPlayAgain = 0
 local function PlayAgain()
     if not RoomEnded() then return end                 -- only on the endgame screen
     if os.clock() - LastPlayAgain < 2 then return end  -- don't double-fire during the transition
+    if Config.WaitForCases and CasesPending and CasesPending() then return end  -- open cases first
 
     local room = GetFocusedRoom()
     if not room then if Config.Debug then Log("playagain: no focused room") end return end
@@ -1237,20 +1245,53 @@ local function BuyCase()
     end)
 end
 
+-- All case (gacha) keys the game defines, so we can open/count EVERY owned case, not just the one we
+-- buy. Falls back to just Config.CaseKey if GachaConfig can't be resolved.
+local function GachaKeys()
+    local gcfg = ResolveModule(SafeChild(ReplicatedStorage, "Config", "GachaConfig"), nil)
+    if type(gcfg) == "table" then
+        local keys = {}
+        for k in pairs(gcfg) do keys[#keys + 1] = k end
+        return keys
+    end
+    return { Config.CaseKey }
+end
+
+-- Total unopened cases across ALL types (used to hold requeue until everything's opened).
+local function TotalUnopenedCases()
+    local gacha = GachaService()
+    if not gacha or not gacha.GetGachaCount then return 0 end
+    local total = 0
+    for _, key in ipairs(GachaKeys()) do
+        local ok, n = pcall(gacha.GetGachaCount, key)
+        if ok and type(n) == "number" then total = total + n end
+    end
+    return total
+end
+
+-- Fulfil the forward declaration so PlayAgain/TryQueue can hold the requeue until cases are opened.
+CasesPending = function()
+    return Config.AutoOpenCase and TotalUnopenedCases() > 0
+end
+
 local function DoBuyAndOpenCase()
     BuyCase()
 
-    -- Open however many of the case we own (direct gacha remote = instant, no animation).
+    -- Open every owned case of every type, in batches, until none are left (direct gacha remote =
+    -- instant with insta-skip). Bounded so a failing open can't loop forever.
     if Config.AutoOpenCase then
         local gacha = GachaService()
-        if gacha and gacha.GetGachaCount then
-            local ownOk, owned = pcall(gacha.GetGachaCount, Config.CaseKey)
-            if ownOk and type(owned) == "number" and owned > 0 then
-                local amount = math.min(owned, 10)
-                local openOk = pcall(gacha.Gacha, Config.CaseKey, amount)
-                if openOk then
+        if gacha and gacha.GetGachaCount and gacha.Gacha then
+            for _, key in ipairs(GachaKeys()) do
+                for _ = 1, 60 do
+                    local ownOk, owned = pcall(gacha.GetGachaCount, key)
+                    if not ownOk or type(owned) ~= "number" or owned <= 0 then break end
+                    local amount = math.min(owned, 10)
+                    local openOk = pcall(gacha.Gacha, key, amount)
+                    if not openOk then break end
                     Session.CasesOpened += amount
-                    Log("opened", amount, Config.CaseKey)
+                    Log("opened", amount, key)
+                    task.wait(0.15)
                 end
             end
         end
@@ -1269,9 +1310,12 @@ local function ApplyInstaSkip()
 end
 
 --=====================================================================
--- Auto Equip most valuable glove / knife / gun (SSG)
+-- Auto Equip most valuable item per slot (gun / grenade / glove ...)
 --=====================================================================
--- Picks the highest-Rap owned item of each slot and equips it. Non-destructive.
+-- For each equipment slot, find the highest-Rap owned item that ACCEPTS that slot and equip it in
+-- loadout 1. SetEquip signature is (loadoutIndex, slot, weaponUid) — confirmed in CommonEquipmentStore.
+local EQUIP_SLOTS = { "Primary", "Secondary", "Grenade", "Glove" }
+
 local function DoAutoEquip()
     if not Config.AutoEquip then return end
     local weapon = WeaponService()
@@ -1282,33 +1326,36 @@ local function DoAutoEquip()
     local content = weapon.GetContent and weapon.GetContent()
     if type(content) ~= "table" then return end
 
-    -- Bucket by weapon family/base name; find the highest-priced variant we own per family.
-    local best = {}   -- baseName -> { uid, price }
+    -- best[slot] = { uid, price } — the most valuable owned item that fits that slot.
+    local best = {}
     for uid, data in pairs(content) do
         local cfgOk, cfg = pcall(wdh.GetConfig, data)
-        local nameOk, name = pcall(wdh.Name, data)
-        if cfgOk and cfg and nameOk and name then
-            local base = tostring(name):match("^([^.]+)") or name
+        if cfgOk and cfg and cfg.AcceptSlots then
             local priceOk, price = pcall(wdh.Price, data)
             price = (priceOk and type(price) == "number") and price or 0
-            if not best[base] or price > best[base].price then
-                best[base] = { uid = uid, price = price, data = data }
+            for i = 1, #EQUIP_SLOTS do
+                local slot = EQUIP_SLOTS[i]
+                if cfg.AcceptSlots[slot] and (not best[slot] or price > best[slot].price) then
+                    best[slot] = { uid = uid, price = price }
+                end
             end
         end
     end
 
-    -- Equip the best of each. SetEquip signature is (uid / weaponKey, ...) — try the common shape.
-    for _, entry in pairs(best) do
-        pcall(equip.SetEquip, entry.uid)
+    for slot, entry in pairs(best) do
+        pcall(equip.SetEquip, 1, slot, entry.uid)   -- loadout 1, slot, weapon uid
     end
 end
 
 --=====================================================================
 -- Auto Claim free rewards (mailbox + battlepass)
 --=====================================================================
+-- Every client Claim function self-gates (checks CanClaim / IsFinished / not-already-claimed BEFORE
+-- hitting the server), so blasting them across a range only actually claims the valid ones.
 local function DoAutoClaim()
     if not Config.AutoClaim then return end
 
+    -- Mailbox (rewards, free cases, gifts)
     local mail = Mailbox()
     if mail and mail.GetAll then
         local ok, list = pcall(mail.GetAll)
@@ -1320,10 +1367,44 @@ local function DoAutoClaim()
         end
     end
 
-    local bp = Battlepass()
-    if bp then
-        pcall(function() bp.ClaimPremiumReward() end)
-        pcall(function() bp.ClaimRebirthReward() end)
+    -- Ranked tier rewards — each rank-up tier drops a case + coins. Claim every claimable tier per mode.
+    local ranked = RankedSvc()
+    if ranked and ranked.ClaimReward then
+        for _, mode in ipairs({ "Duel", "Arcade" }) do
+            for tier = 1, 40 do
+                pcall(ranked.ClaimReward, mode, tier)
+            end
+        end
+    end
+
+    -- Quests (daily / weekly / etc.) — claim each finished, un-rewarded quest, and the group reward.
+    local quest = QuestService()
+    local qcfg = ResolveModule(SafeChild(ReplicatedStorage, "Config", "QuestConfig"), nil)
+    if quest and quest.ClaimReward and type(qcfg) == "table" then
+        for group, cfg in pairs(qcfg) do
+            if type(cfg) == "table" then
+                pcall(quest.ClaimReward, group)                 -- whole-group reward
+                if type(cfg.Quests) == "table" then
+                    for questId in pairs(cfg.Quests) do
+                        pcall(quest.ClaimReward, group, questId)
+                    end
+                end
+            end
+        end
+    end
+
+    -- Battlepass + Minipass — premium/rebirth one-shots plus every claimable tier on both tracks.
+    for _, pass in ipairs({ Battlepass(), Minipass() }) do
+        if pass then
+            pcall(function() if pass.ClaimPremiumReward then pass.ClaimPremiumReward() end end)
+            pcall(function() if pass.ClaimRebirth3Reward then pass.ClaimRebirth3Reward() end end)
+            if pass.Claim then
+                for level = 1, 120 do
+                    pcall(pass.Claim, level, false)   -- free track
+                    pcall(pass.Claim, level, true)    -- premium track
+                end
+            end
+        end
     end
 end
 
@@ -1361,6 +1442,7 @@ local function TryQueue()
     if not mm then return end
     if mm.Matching then return end          -- already in queue
     if InMatch() then return end            -- still in a match / scoreboard
+    if Config.WaitForCases and CasesPending and CasesPending() then return end  -- open cases first
 
     local queue = GetRankedQueue()
     if not queue then return end
@@ -1480,10 +1562,10 @@ task.spawn(function()
     -- here: it must be fast, not stuck behind seconds of throttled shop/inventory work.
     task.spawn(function()
         while Alive() do
-            Throttled(DoBuyAndOpenCase)
-            Throttled(DoAutoSell)
-            Throttled(DoAutoEquip)
-            Throttled(DoAutoClaim)
+            Throttled("buycase", DoBuyAndOpenCase)
+            Throttled("autosell", DoAutoSell)
+            Throttled("autoequip", DoAutoEquip)
+            Throttled("autoclaim", DoAutoClaim)
             task.wait(Config.LoopInterval)
         end
     end)
