@@ -35,10 +35,12 @@ local Config = {
     Ragebot       = true,
     Prediction    = 1.34,          -- velocity lead factor (1.0 = full ping lead, like Skeet's 100%)
     WallCheck     = true,          -- prefer body points with clear line of sight (falls back to head)
-    CameraLock    = true,          -- smoothly aim the real camera at the target (continuous tracking)
-    CamSmooth     = 0.18,          -- 0..1 lerp per frame — lower = smoother/lazier (less sus)
-    CamJitter     = 0.45,          -- studs of random jitter on the aim point so it's not pixel-locked
+    CameraLock    = false,         -- OFF: silent aim uses the muzzle origin, not the camera, so moving
+                                   -- the camera just desynced the viewmodel and caused misses
+    CamSmooth     = 0.18,
+    CamJitter     = 0.45,
     Pathfind      = true,          -- walk to the current target with PathfindingService
+    StayInSpawn   = true,          -- don't move at all — just hold position and silent-aim
     WalkSpeed     = 22,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
                                    -- cancelled by MoveTo, so we just set speed directly instead.
     AutoRequeue   = true,
@@ -96,7 +98,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r9"
+local FARM_VERSION = "2026-08-05-beginner-r10"
 
 local function Log(...)
     print("[farm]", ...)
@@ -332,6 +334,17 @@ local function WeaponDataHelper()return GetSvc("WDH",      SafeChild(ReplicatedS
 local function ShootComponent()  return GetSvc("Shoot",    SafeChild(ReplicatedStorage, "Common", "CombatService", "CommonComponent", "CommonShootableComponent"), { "Shoot", "GetSpread", "StartShooting", "Action" }) end
 local function ServerModule()    return GetSvc("Server",   SafeChild(ReplicatedStorage, "Remote", "Server"), { "IsArcade", "IsNewbie", "GetMode" }) end
 local function ActionCtrl()      return GetSvc("Action",   SafeChild(ReplicatedStorage, "Client", "input", "ActionController"), { "Call", "CallAny", "SetActionHandler" }) end
+local function CameraCtrl()      return GetSvc("CamCtrl",  SafeChild(ReplicatedStorage, "Client", "CameraController"), { "GetCombatOrigin", "GetCombatOriginFn" }) end
+
+-- The real muzzle-adjusted shot origin CFrame the game fires from. Falls back to the camera.
+local function CombatOrigin()
+    local cc = CameraCtrl()
+    if cc and cc.GetCombatOrigin then
+        local ok, cf = pcall(cc.GetCombatOrigin)
+        if ok and typeof(cf) == "CFrame" then return cf end
+    end
+    return Camera.CFrame
+end
 
 -- GameService: cached singleton; require first, GC fallback second. IsGaming/room/ban/vote/rematch
 -- all hang off this, so it MUST resolve.
@@ -940,18 +953,18 @@ function Ragebot.Step()
     local enemies = GatherEnemies()
     if Config.WallCheck then RefreshRayFilter(enemies) end
 
-    -- Pathfinding chases the nearest enemy regardless of walls (so we walk toward line of sight);
-    -- firing only targets one we can actually see.
+    -- Shots come from the game's combat origin (muzzle-adjusted), NOT the camera — using the camera
+    -- origin was making shots miss on the server.
+    local origin = CombatOrigin()
+    local originPos = origin.Position
+
     Ragebot.CurrentTarget = GetNearestEnemy()
 
-    local target = SelectTarget(enemies, Camera.CFrame.Position)
+    local target = SelectTarget(enemies, originPos)
     if not target then return end
 
-    -- Resolve the aim point (visible body point -> reprojected true pos + lead).
-    local _, aimPos = PickPoint(target, Camera.CFrame.Position)
+    local _, aimPos = PickPoint(target, originPos)
     if not aimPos then return end
-    -- The smooth camlock (below) tracks the target continuously; the silent-aim hook still redirects
-    -- the actual shot precisely, so hit reg doesn't depend on the camera being pixel-perfect.
 
     local combat = CombatService()
     local shootMod = ShootComponent()
@@ -972,8 +985,7 @@ function Ragebot.Step()
     if ammoOk and canShoot == false then return end   -- out of ammo / can't attack (let it reload)
 
     Ragebot.LastShot = Workspace:GetServerTimeNow()
-    local cam = Camera.CFrame
-    pcall(shootable.Shoot, shootable, cam.Position, cam.LookVector, nil)
+    pcall(shootable.Shoot, shootable, origin.Position, origin.LookVector, nil)
 end
 
 Connect(RunService.Heartbeat, function()
@@ -1144,7 +1156,7 @@ local function RoamStep()
 end
 
 Connect(RunService.Heartbeat, function()
-    if not Ready or not Config.Pathfind or not Alive() then return end
+    if not Ready or not Config.Pathfind or Config.StayInSpawn or not Alive() then return end
     if not IsGaming() then if #PathViz.Parts > 0 then ClearPathViz() end return end
 
     local target = Ragebot.CurrentTarget
