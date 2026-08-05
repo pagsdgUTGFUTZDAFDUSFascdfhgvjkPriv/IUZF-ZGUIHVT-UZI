@@ -41,6 +41,8 @@ local Config = {
     CamJitter     = 0.45,
     Pathfind      = true,          -- walk to the current target with PathfindingService
     StayInSpawn   = true,          -- don't move at all — just hold position and silent-aim
+    SpawnRadius   = 8,             -- max studs we're allowed to drift from the spawn point
+    SpawnMaxHeight= 25,            -- max studs above spawn we're allowed to rise (jump height cap)
     SpamJump      = true,          -- inf-jump (harder to hit)
     JumpInterval  = 0.25,          -- seconds between jumps — bigger = chiller (won't fly out of bounds)
     WalkSpeed     = 22,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
@@ -48,6 +50,7 @@ local Config = {
     AutoRequeue   = true,
     WaitForCases  = true,          -- don't requeue until every owned case has been opened
     BanMapName    = "Grid",        -- always ban this map if it's in the ban pool (nil = random ban)
+    VoteMapName   = "Skyscraper_DUEL",  -- always vote this map if it's offered (nil = random)
 
     KDNormalizer  = true,
     LossRate      = 0.03,          -- lose ~3% of games on purpose (whiff the whole game)
@@ -100,7 +103,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r16"
+local FARM_VERSION = "2026-08-05-beginner-r20"
 
 local function Log(...)
     print("[farm]", ...)
@@ -508,7 +511,15 @@ local function AutoMapPhase()
         if vm.Timeout and Workspace:GetServerTimeNow() > vm.Timeout then return end
         if AlreadyPicked("VoteMap", vm.Maps) then return end
 
-        local pick = vm.Maps[math.random(1, #vm.Maps)]
+        -- Prefer the configured map (Western — most open); otherwise random.
+        local pick
+        if Config.VoteMapName then
+            for i = 1, #vm.Maps do
+                if vm.Maps[i] == Config.VoteMapName then pick = vm.Maps[i] break end
+            end
+        end
+        pick = pick or vm.Maps[math.random(1, #vm.Maps)]
+
         pcall(gs.VoteMap, pick, CENTER)
         Log("voted map", pick)
     end
@@ -1195,13 +1206,51 @@ end)
 local LastJump = 0
 Connect(RunService.Heartbeat, function()
     if not Config.SpamJump or not Ready or not Alive() or not IsGaming() then return end
-    -- Inf-jump but rate-limited: jumping EVERY frame stacked upward force and flung us out of bounds.
-    -- Spacing the jumps keeps the float without the launch.
     if os.clock() - LastJump < Config.JumpInterval then return end
+
+    local char = LocalCharacter()
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return end
+
+    -- Only jump when we're NOT already rising (grounded / at apex / falling). Jumping again while
+    -- still going up stacks velocity and launches us out of bounds — this keeps it a bounded float.
+    if root.AssemblyLinearVelocity.Y > 1 then return end
+
     LastJump = os.clock()
-    local hum = LocalCharacter() and LocalCharacter():FindFirstChildOfClass("Humanoid")
-    if hum then
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+end)
+
+--=====================================================================
+-- Spawn anchor  (keep us pinned near the spawn point so jumping can't drift/fling us out of bounds)
+--=====================================================================
+local SpawnPos
+Connect(RunService.Heartbeat, function()
+    if not Ready or not Alive() or not IsGaming() then SpawnPos = nil return end
+    if not Config.StayInSpawn then return end
+
+    local root = LocalRoot()
+    if not root then return end
+
+    -- Capture the spawn point the first grounded frame after (re)spawning.
+    if not SpawnPos then
+        if root.AssemblyLinearVelocity.Magnitude < 5 then SpawnPos = root.Position end
+        return
+    end
+
+    local vel = root.AssemblyLinearVelocity
+
+    -- Horizontal: if we've drifted past the radius, push velocity back toward spawn.
+    local flat = (root.Position - SpawnPos) * Vector3.new(1, 0, 1)
+    if flat.Magnitude > Config.SpawnRadius then
+        local pull = -flat.Unit * 18
+        root.AssemblyLinearVelocity = Vector3.new(pull.X, vel.Y, pull.Z)
+        vel = root.AssemblyLinearVelocity
+    end
+
+    -- Vertical: never let us climb above the height cap (kills upward velocity at the ceiling).
+    if root.Position.Y > SpawnPos.Y + Config.SpawnMaxHeight and vel.Y > 0 then
+        root.AssemblyLinearVelocity = Vector3.new(vel.X, 0, vel.Z)
     end
 end)
 
