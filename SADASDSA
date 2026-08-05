@@ -96,7 +96,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r5"
+local FARM_VERSION = "2026-08-05-beginner-r6"
 
 local function Log(...)
     print("[farm]", ...)
@@ -1616,24 +1616,33 @@ end
 -- Requirement (Config/Beginner.lua -> ToBeginnerServer): Status.Killed >= 50 AND GamePlayed >= 2.
 -- In a newbie/arcade server "Play" is just the Respawn context action, which drops you into the
 -- running FFA room; the ragebot then farms the kills.
+-- We know exactly which place we're in from the PlaceId, so no IsNewbie/IsArcade guessing needed.
 local function InBeginnerServer()
-    local srv = ServerModule()
-    if not srv then return false end
-    local nOk, newbie = pcall(srv.IsNewbie)
-    local aOk, arcade = pcall(srv.IsArcade)
-    return (nOk and newbie == true) and (aOk and arcade == true)
+    return Place == "beginner"
 end
 
 local function BeginnerKills()   return GetStatus(StatusKey.Killed) end
 local function BeginnerGames()   return GetStatus(StatusKey.GamePlayed) end
 local function BeginnerDone()    return BeginnerKills() >= 50 and BeginnerGames() >= 2 end
 
--- Press "Play" = fire the Respawn action, spawning us into the FFA room.
+-- Press "Play" = fire the Respawn action. The game's own handler then joins the running FFA room
+-- (GameService.Join) and fast-respawns us — so this covers both first spawn and respawns.
 local function PressPlay()
     local ac = ActionCtrl()
     if ac and ac.Call then
         pcall(ac.Call, "Respawn", Enum.UserInputState.Begin)
     end
+end
+
+-- Turn on the game's AutoRespawn setting so death -> instant respawn without us pressing anything.
+local function EnableAutoRespawn()
+    local settings = ResolveModule(SafeChild(ReplicatedStorage, "Client", "Settings"), { "AutoRespawn", "AutoSprint" })
+    local ar = settings and settings.AutoRespawn
+    if ar and ar.Value ~= nil then
+        pcall(function() ar.Value = true end)
+        return true
+    end
+    return false
 end
 
 local function LocalAlive()
@@ -1682,18 +1691,13 @@ task.spawn(function()
         end
     end)
 
-    -- Report which kind of server we landed in (so each of the 8 accounts is easy to verify).
-    task.spawn(function()
-        local srv = ServerModule()
-        local mode = srv and select(2, pcall(srv.GetMode)) or "?"
-        local newbie = srv and select(2, pcall(srv.IsNewbie)) or false
-        if InBeginnerServer() then
-            Log(("BEGINNER SERVER — mode=%s newbie=%s (kills=%d/50 games=%d/2)"):format(
-                tostring(mode), tostring(newbie), BeginnerKills(), BeginnerGames()))
-        else
-            Log(("not a beginner server — mode=%s newbie=%s"):format(tostring(mode), tostring(newbie)))
-        end
-    end)
+    -- Report where we landed (so each of the 8 accounts is easy to verify).
+    if InBeginnerServer() then
+        Log(("BEGINNER place — kills=%d/50 games=%d/2, autoRespawn=%s"):format(
+            BeginnerKills(), BeginnerGames(), tostring(EnableAutoRespawn())))
+    else
+        Log("place: " .. Place)
+    end
 
     -- Auto beginner-server clear (the current focus): press Play into FFA, ragebot farms the kills.
     task.spawn(BeginnerLoop)
