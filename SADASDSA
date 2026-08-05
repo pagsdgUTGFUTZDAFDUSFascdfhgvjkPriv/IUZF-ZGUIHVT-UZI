@@ -41,7 +41,8 @@ local Config = {
     CamJitter     = 0.45,
     Pathfind      = true,          -- walk to the current target with PathfindingService
     StayInSpawn   = true,          -- don't move at all — just hold position and silent-aim
-    SpamJump      = true,          -- continuously jump (harder to hit)
+    SpamJump      = true,          -- inf-jump (harder to hit)
+    JumpInterval  = 0.25,          -- seconds between jumps — bigger = chiller (won't fly out of bounds)
     WalkSpeed     = 22,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
                                    -- cancelled by MoveTo, so we just set speed directly instead.
     AutoRequeue   = true,
@@ -99,7 +100,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r13"
+local FARM_VERSION = "2026-08-05-beginner-r15"
 
 local function Log(...)
     print("[farm]", ...)
@@ -1198,15 +1199,17 @@ end)
 --=====================================================================
 -- Spam jump  (bhop — makes us harder to hit)
 --=====================================================================
+local LastJump = 0
 Connect(RunService.Heartbeat, function()
     if not Config.SpamJump or not Ready or not Alive() or not IsGaming() then return end
+    -- Inf-jump but rate-limited: jumping EVERY frame stacked upward force and flung us out of bounds.
+    -- Spacing the jumps keeps the float without the launch.
+    if os.clock() - LastJump < Config.JumpInterval then return end
+    LastJump = os.clock()
     local hum = LocalCharacter() and LocalCharacter():FindFirstChildOfClass("Humanoid")
     if hum then
         pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
     end
-    -- Also fire the game's own Jump action in case movement is entity-state driven.
-    local ac = ActionCtrl()
-    if ac and ac.Call then pcall(ac.Call, "Jump", Enum.UserInputState.Begin) end
 end)
 
 --=====================================================================
