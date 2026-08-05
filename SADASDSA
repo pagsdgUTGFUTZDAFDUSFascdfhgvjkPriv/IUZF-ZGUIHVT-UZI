@@ -98,7 +98,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r10"
+local FARM_VERSION = "2026-08-05-beginner-r11"
 
 local function Log(...)
     print("[farm]", ...)
@@ -614,7 +614,9 @@ RayParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local LastRayRefresh = 0
 local function RefreshRayFilter(enemies)
-    if os.clock() - LastRayRefresh < 0.1 then return end
+    -- Refresh basically every frame (tiny throttle only to avoid double-work in one tick) so line of
+    -- sight is never stale for a fast peek.
+    if os.clock() - LastRayRefresh < 0.005 then return end
     LastRayRefresh = os.clock()
 
     local filter, n = {}, 0
