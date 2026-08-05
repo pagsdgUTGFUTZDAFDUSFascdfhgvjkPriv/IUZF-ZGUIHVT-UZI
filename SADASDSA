@@ -55,7 +55,7 @@ local Config = {
 
     AutoOpenCase  = true,
     InstaSkip     = true,          -- skip the case-opening animation
-    AutoSell      = true,          -- sell Common/UnCommon/Rare/Epic (never locked/favorited/Legendary+)
+    AutoSell      = false,         -- keep ALL skins — never sell
     AutoEquip     = true,          -- equip most valuable glove / knife / SSG
     AutoClaim     = true,          -- mailbox + battlepass free rewards
 
@@ -88,7 +88,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-04-r20"
+local FARM_VERSION = "2026-08-04-r21"
 
 local function Log(...)
     print("[farm]", ...)
