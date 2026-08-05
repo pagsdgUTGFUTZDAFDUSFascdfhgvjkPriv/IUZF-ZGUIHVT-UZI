@@ -100,7 +100,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r15"
+local FARM_VERSION = "2026-08-05-beginner-r16"
 
 local function Log(...)
     print("[farm]", ...)
@@ -765,25 +765,15 @@ end
 
 -- SelectTarget: closest live enemy we actually have line of sight to. Skips a target whose root is
 -- wall-blocked AND whose head has no visible point — exactly Skeet's wall check.
--- Is ANY body part of this enemy visible from origin? (single ray each — fast)
-local function AnyPartVisible(data, origin)
-    for i = 1, #HIT_POINTS do
-        local p = data.BodyParts[HIT_POINTS[i]]
-        if p and not RayBlocked(origin, p.Position) then return true end
-    end
-    return false
-end
-
-local function SelectTarget(enemies, origin)
+-- Just the closest live enemy. Visibility is decided in PickPoint (so a head-peek where only the head
+-- edge shows isn't wrongly rejected here).
+local function SelectTarget(enemies)
     local best, bestScore = nil, math.huge
     for i = 1, #enemies do
         local data = enemies[i]
-        if data.Humanoid.Health > 0 then
-            local visible = (not Config.WallCheck or not origin) or AnyPartVisible(data, origin)
-            if visible and data.Distance < bestScore then
-                bestScore = data.Distance
-                best = data
-            end
+        if data.Humanoid.Health > 0 and data.Distance < bestScore then
+            bestScore = data.Distance
+            best = data
         end
     end
     return best
@@ -793,17 +783,20 @@ end
 -- this game, so we don't insist on the head — whatever's exposed gets shot. Reproject + lead.
 -- Returns (part, worldPosition), or nil if every part is wall-blocked.
 local function PickPoint(data, origin)
-    local part
+    local part, visiblePoint
     for i = 1, #HIT_POINTS do
         local p = data.BodyParts[HIT_POINTS[i]]
-        if p and (not Config.WallCheck or not origin or not RayBlocked(origin, p.Position)) then
-            part = p
-            break
+        if p then
+            if not Config.WallCheck or not origin then part = p break end
+            if not RayBlocked(origin, p.Position) then part = p break end        -- center visible
+            local vp = SampleVisiblePoint(origin, p)                             -- else an exposed edge
+            if vp then part = p; visiblePoint = vp break end
         end
     end
     if not part then return nil end
 
-    local position = Resolver.ReprojectPoint(data.Player, data.Character, data.RootPart, part.Position)
+    local position = visiblePoint or part.Position
+    position = Resolver.ReprojectPoint(data.Player, data.Character, data.RootPart, position)
 
     local lead = Resolver.TrueVelocity(data.Player, data.Character, data.RootPart) * (GetPing() * Config.Prediction)
     if lead.Magnitude > 20 then lead = lead.Unit * 20 end
@@ -866,7 +859,7 @@ local function InstallFireHooks()
 
         local enemies = GatherEnemies()
         if Config.WallCheck then RefreshRayFilter(enemies) end
-        local target = SelectTarget(enemies, start)
+        local target = SelectTarget(enemies)
         if target then
             local part, position = PickPoint(target, start)
             if part and position then
@@ -951,7 +944,7 @@ function Ragebot.Step()
 
     Ragebot.CurrentTarget = GetNearestEnemy()
 
-    local target = SelectTarget(enemies, originPos)
+    local target = SelectTarget(enemies)
     if not target then return end
 
     local _, aimPos = PickPoint(target, originPos)
