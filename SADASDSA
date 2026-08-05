@@ -96,7 +96,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r8"
+local FARM_VERSION = "2026-08-05-beginner-r9"
 
 local function Log(...)
     print("[farm]", ...)
@@ -1638,13 +1638,19 @@ end
 -- Requirement (Config/Beginner.lua -> ToBeginnerServer): Status.Killed >= 50 AND GamePlayed >= 2.
 -- In a newbie/arcade server "Play" is just the Respawn context action, which drops you into the
 -- running FFA room; the ragebot then farms the kills.
--- Beginner = the game's own Newbie flag. The PlaceId alone isn't enough (ranked duels can run in the
--- same arcade place), so we use Server.IsNewbie() — the actual "this is a beginner server" flag.
-local function InBeginnerServer()
+-- Beginner detection via the SERVER's raw mode (Arcade_Beginner / FFA_Beginner). IsNewbie() is no
+-- good — it reflects the ACCOUNT being new, so it stays true even in a ranked match. The raw mode is
+-- the actual server type: ranked servers are FFA_Ranked / Matchmaking, beginner ones contain "Beginner".
+local function ServerRawMode()
     local srv = ServerModule()
-    if not srv or not srv.IsNewbie then return false end
-    local ok, newbie = pcall(srv.IsNewbie)
-    return ok and newbie == true
+    if not srv or not srv.GetRawMode then return nil end
+    local ok, raw = pcall(srv.GetRawMode)
+    return (ok and type(raw) == "string" and raw ~= "") and raw or nil
+end
+
+local function InBeginnerServer()
+    local raw = ServerRawMode()
+    return raw ~= nil and raw:find("Beginner") ~= nil
 end
 
 local function BeginnerKills()   return GetStatus(StatusKey.Killed) end
@@ -1729,11 +1735,10 @@ task.spawn(function()
     end)
 
     -- Report where we landed (so each of the 8 accounts is easy to verify).
+    Log(("place=%s rawMode=%s beginner=%s"):format(Place, tostring(ServerRawMode()), tostring(InBeginnerServer())))
     if InBeginnerServer() then
-        Log(("BEGINNER place — kills=%d/50 games=%d/2, autoRespawn=%s"):format(
+        Log(("BEGINNER — kills=%d/50 games=%d/2, autoRespawn=%s"):format(
             BeginnerKills(), BeginnerGames(), tostring(EnableAutoRespawn())))
-    else
-        Log("place: " .. Place)
     end
 
     -- Behaviour by server type (Newbie flag, not just PlaceId):
