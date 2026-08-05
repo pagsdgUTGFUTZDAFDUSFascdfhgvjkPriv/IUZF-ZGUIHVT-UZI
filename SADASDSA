@@ -96,7 +96,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r7"
+local FARM_VERSION = "2026-08-05-beginner-r8"
 
 local function Log(...)
     print("[farm]", ...)
@@ -547,34 +547,39 @@ local function ModelFriendly(model, plr)
     return false
 end
 
--- Build the enemy list from EVERY combatant model. FFA bots aren't Players — they're Models tagged
--- "GameClient" (same tag real player characters get), so we enumerate that tag instead of GetPlayers.
+-- Add a combatant model to the list if it's a live, non-friendly enemy.
+local function AddEnemy(list, seen, model, myRoot)
+    if not model or seen[model] or model == LocalCharacter() or not model:IsA("Model") then return end
+    local hum  = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart")
+    if not (hum and root and hum.Health > 0) then return end
+    local plr = Players:GetPlayerFromCharacter(model)   -- nil for bots
+    if ModelFriendly(model, plr) then return end
+
+    seen[model] = true
+    local parts = {}
+    for i = 1, #HIT_POINTS do
+        local p = model:FindFirstChild(HIT_POINTS[i])
+        if p and p:IsA("BasePart") then parts[HIT_POINTS[i]] = p end
+    end
+    list[#list + 1] = {
+        Character = model, Player = plr, Humanoid = hum,
+        RootPart = root, RootPosition = root.Position, BodyParts = parts,
+        Distance = myRoot and (root.Position - myRoot.Position).Magnitude or 0,
+    }
+end
+
+-- Enemies from BOTH sources: real Players (reliable for ranked 1v1) AND GameClient-tagged models
+-- (FFA bots, which aren't Players). Deduped.
 local function GatherEnemies()
     local myRoot = LocalRoot()
-    local myChar = LocalCharacter()
     local list, seen = {}, {}
 
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then AddEnemy(list, seen, plr.Character, myRoot) end
+    end
     for _, model in ipairs(CollectionService:GetTagged("GameClient")) do
-        if model ~= myChar and not seen[model] and model:IsA("Model") then
-            seen[model] = true
-            local hum  = model:FindFirstChildOfClass("Humanoid")
-            local root = model:FindFirstChild("HumanoidRootPart")
-            if hum and root and hum.Health > 0 then
-                local plr = Players:GetPlayerFromCharacter(model)   -- nil for bots
-                if not ModelFriendly(model, plr) then
-                    local parts = {}
-                    for i = 1, #HIT_POINTS do
-                        local p = model:FindFirstChild(HIT_POINTS[i])
-                        if p and p:IsA("BasePart") then parts[HIT_POINTS[i]] = p end
-                    end
-                    list[#list + 1] = {
-                        Character = model, Player = plr, Humanoid = hum,
-                        RootPart = root, RootPosition = root.Position, BodyParts = parts,
-                        Distance = myRoot and (root.Position - myRoot.Position).Magnitude or 0,
-                    }
-                end
-            end
-        end
+        AddEnemy(list, seen, model, myRoot)
     end
     return list
 end
@@ -1115,33 +1120,50 @@ local function WalkToward(targetPos)
     end
 end
 
--- Roam: when there's no target, wander to a random nearby point so we cover the map and find bots.
+-- Roam: no target -> wander to a random point (via pathfinding so we don't wall-hug), picking a new
+-- goal every few seconds or when reached. Prefers open goals (rejects ones with no clear sightline).
 local Roam = { Goal = nil, Until = 0 }
 local function RoamStep()
-    local hum = LocalCharacter() and LocalCharacter():FindFirstChildOfClass("Humanoid")
     local root = LocalRoot()
-    if not hum or not root then return end
-    if not Roam.Goal or os.clock() > Roam.Until or (root.Position - Roam.Goal).Magnitude < 8 then
-        local angle = math.random() * math.pi * 2
-        local dist = 40 + math.random() * 60
-        Roam.Goal = root.Position + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+    if not root then return end
+
+    if not Roam.Goal or os.clock() > Roam.Until or (root.Position - Roam.Goal).Magnitude < 10 then
+        local best
+        for _ = 1, 5 do   -- sample a few candidates, keep the most "open" one
+            local angle = math.random() * math.pi * 2
+            local dist = 45 + math.random() * 65
+            local cand = root.Position + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+            if not RayBlocked(root.Position, cand) then best = cand break end  -- clear path -> take it
+            best = best or cand
+        end
+        Roam.Goal = best
         Roam.Until = os.clock() + 5
     end
-    hum:MoveTo(Roam.Goal)
+
+    WalkToward(Roam.Goal)   -- pathfound movement instead of raw MoveTo
 end
 
 Connect(RunService.Heartbeat, function()
     if not Ready or not Config.Pathfind or not Alive() then return end
     if not IsGaming() then if #PathViz.Parts > 0 then ClearPathViz() end return end
+
     local target = Ragebot.CurrentTarget
-    if target and EnemyAlive(target) then
-        local root = target:FindFirstChild("HumanoidRootPart")
-        if root then
-            SafeCall("pathfind.walk", WalkToward, root.Position)
+    local troot = target and EnemyAlive(target) and target:FindFirstChild("HumanoidRootPart")
+
+    if troot then
+        local myRoot = LocalRoot()
+        -- If we already have line of sight we can silent-aim them, so HOLD in the open instead of
+        -- walking into their face / a corner. Only path toward them to *gain* LoS.
+        local hasLoS = myRoot and not RayBlocked(myRoot.Position, troot.Position)
+        if hasLoS then
+            if #PathViz.Parts > 0 then ClearPathViz() end
+            local hum = LocalCharacter() and LocalCharacter():FindFirstChildOfClass("Humanoid")
+            if hum then hum:MoveTo(myRoot.Position) end   -- stop moving, hold position
+        else
+            SafeCall("pathfind.walk", WalkToward, troot.Position)
         end
     else
-        if #PathViz.Parts > 0 then ClearPathViz() end
-        SafeCall("roam", RoamStep)   -- no target -> wander to find bots
+        SafeCall("roam", RoamStep)   -- no target -> wander (pathfound) to find enemies
     end
 end)
 
@@ -1616,9 +1638,13 @@ end
 -- Requirement (Config/Beginner.lua -> ToBeginnerServer): Status.Killed >= 50 AND GamePlayed >= 2.
 -- In a newbie/arcade server "Play" is just the Respawn context action, which drops you into the
 -- running FFA room; the ragebot then farms the kills.
--- We know exactly which place we're in from the PlaceId, so no IsNewbie/IsArcade guessing needed.
+-- Beginner = the game's own Newbie flag. The PlaceId alone isn't enough (ranked duels can run in the
+-- same arcade place), so we use Server.IsNewbie() — the actual "this is a beginner server" flag.
 local function InBeginnerServer()
-    return Place == "beginner"
+    local srv = ServerModule()
+    if not srv or not srv.IsNewbie then return false end
+    local ok, newbie = pcall(srv.IsNewbie)
+    return ok and newbie == true
 end
 
 local function BeginnerKills()   return GetStatus(StatusKey.Killed) end
@@ -1710,8 +1736,8 @@ task.spawn(function()
         Log("place: " .. Place)
     end
 
-    -- Place-aware behaviour:
-    if Place == "beginner" then
+    -- Behaviour by server type (Newbie flag, not just PlaceId):
+    if InBeginnerServer() then
         -- Beginner FFA clear: press Play into the room, ragebot farms bots for 50 kills / 2 games.
         task.spawn(BeginnerLoop)
     else
