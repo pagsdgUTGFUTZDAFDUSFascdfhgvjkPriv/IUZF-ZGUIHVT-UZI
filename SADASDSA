@@ -88,7 +88,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r3"
+local FARM_VERSION = "2026-08-05-beginner-r4"
 
 local function Log(...)
     print("[farm]", ...)
@@ -422,6 +422,17 @@ end
 --   ban:  GameService.BanMap(map, clickPos)   from room.BanMaps.Maps
 --   vote: GameService.VoteMap(map, clickPos)  from room.VotingMaps.Maps
 local CENTER = UDim2.new(0.5, 0, 0.5, 0)
+
+-- Have we already banned/voted a map that's actually in THIS pool? (Ignore a stale attribute from a
+-- previous round whose map isn't offered now.)
+local function AlreadyPicked(attrName, maps)
+    local mine = LocalPlayer:GetAttribute(attrName)
+    if not mine then return false end
+    for i = 1, #maps do if maps[i] == mine then return true end end
+    return false
+end
+
+local _lastMapDbg = 0
 local function AutoMapPhase()
     local gs = GameService()
     local room = GetFocusedRoom()
@@ -430,13 +441,24 @@ local function AutoMapPhase()
     local ok, state = pcall(function() return room:GetState() end)
     if not ok then return end
 
+    if Config.Debug and (state == "BanMap" or state == "Vote") and os.clock() - _lastMapDbg > 2 then
+        _lastMapDbg = os.clock()
+        local bm, vm = room.BanMaps, room.VotingMaps
+        Log(("mapphase: state=%s banMaps=%s voteMaps=%s banAttr=%s voteAttr=%s"):format(
+            tostring(state),
+            tostring(bm and bm.Maps and #bm.Maps or "-"),
+            tostring(vm and vm.Maps and #vm.Maps or "-"),
+            tostring(LocalPlayer:GetAttribute("BanMap")),
+            tostring(LocalPlayer:GetAttribute("VoteMap"))))
+    end
+
     if state == "BanMap" and gs.BanMap then
-        if LocalPlayer:GetAttribute("BanMap") then return end       -- already banned this round
         local bm = room.BanMaps
         if type(bm) ~= "table" or type(bm.Maps) ~= "table" or #bm.Maps == 0 then return end
-        if Workspace:GetServerTimeNow() > (bm.Timeout or 0) then return end
+        -- Only gate on Timeout if it's actually provided (nil = don't skip).
+        if bm.Timeout and Workspace:GetServerTimeNow() > bm.Timeout then return end
+        if AlreadyPicked("BanMap", bm.Maps) then return end
 
-        -- Prefer banning the configured map (Grid) if it's in the pool; otherwise random.
         local pick
         if Config.BanMapName then
             for i = 1, #bm.Maps do
@@ -449,10 +471,11 @@ local function AutoMapPhase()
         Log("banned map", pick)
 
     elseif state == "Vote" and gs.VoteMap then
-        if LocalPlayer:GetAttribute("VoteMap") then return end       -- already voted this round
         local vm = room.VotingMaps
         if type(vm) ~= "table" or type(vm.Maps) ~= "table" or #vm.Maps == 0 then return end
-        if Workspace:GetServerTimeNow() > (vm.Timeout or 0) then return end
+        if vm.Timeout and Workspace:GetServerTimeNow() > vm.Timeout then return end
+        if AlreadyPicked("VoteMap", vm.Maps) then return end
+
         local pick = vm.Maps[math.random(1, #vm.Maps)]
         pcall(gs.VoteMap, pick, CENTER)
         Log("voted map", pick)
@@ -1657,6 +1680,14 @@ task.spawn(function()
 
     -- Auto beginner-server clear (the current focus): press Play into FFA, ragebot farms the kills.
     task.spawn(BeginnerLoop)
+
+    -- Map ban/vote — always on (works in ranked even while the rest of the ranked farm is off).
+    task.spawn(function()
+        while Alive() do
+            SafeCall("mapphase", AutoMapPhase)
+            task.wait(1)
+        end
+    end)
 
     --[[ RANKED FARM — commented out while we clear beginner servers. Re-enable once graduated.
     -- Heavy actions loop (buy/open, sell, equip, claim) — one at a time, spaced out.
