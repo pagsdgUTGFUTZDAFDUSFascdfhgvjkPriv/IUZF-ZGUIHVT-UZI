@@ -88,7 +88,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-04-r21"
+local FARM_VERSION = "2026-08-05-beginner-r2"
 
 local function Log(...)
     print("[farm]", ...)
@@ -313,6 +313,8 @@ local function QuestService()    return GetSvc("Quest",    SafeChild(ReplicatedS
 local function EntityService()   return GetSvc("Entity",   SafeChild(ReplicatedStorage, "Remote", "EntityService"), { "GetLocalEntity", "GetEntity", "FetchEntity" }) end
 local function WeaponDataHelper()return GetSvc("WDH",      SafeChild(ReplicatedStorage, "Common", "WeaponService", "WeaponDataHelper"), { "GetConfig", "Name", "Price", "WearFactor" }) end
 local function ShootComponent()  return GetSvc("Shoot",    SafeChild(ReplicatedStorage, "Common", "CombatService", "CommonComponent", "CommonShootableComponent"), { "Shoot", "GetSpread", "StartShooting", "Action" }) end
+local function ServerModule()    return GetSvc("Server",   SafeChild(ReplicatedStorage, "Remote", "Server"), { "IsArcade", "IsNewbie", "GetMode" }) end
+local function ActionCtrl()      return GetSvc("Action",   SafeChild(ReplicatedStorage, "Client", "input", "ActionController"), { "Call", "CallAny", "SetActionHandler" }) end
 
 -- GameService: cached singleton; require first, GC fallback second. IsGaming/room/ban/vote/rematch
 -- all hang off this, so it MUST resolve.
@@ -491,38 +493,46 @@ end
 -- Body points we try to hit, in priority order (R15 + R6 covered).
 local HIT_POINTS = { "Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso" }
 
--- Is this player friendly to us? Uses the game's own EntityService.IsFriendly (handles teams/1v1),
--- falls back to Team, else treats as enemy.
-local function PlayerFriendly(plr)
+local CollectionService = game:GetService("CollectionService")
+
+-- Friendly check for any combatant MODEL (player char OR bot). EntityService.IsFriendly resolves the
+-- entity from the instance, so it works for bots too; FFA = everyone is an enemy.
+local function ModelFriendly(model, plr)
     local ent = EntityService()
     if ent and ent.IsFriendly then
-        local ok, res = pcall(ent.IsFriendly, plr)
+        local ok, res = pcall(ent.IsFriendly, plr or model)
         if ok and res ~= nil then return res end
     end
-    if plr.Team and LocalPlayer.Team then return plr.Team == LocalPlayer.Team end
+    if plr and plr.Team and LocalPlayer.Team then return plr.Team == LocalPlayer.Team end
     return false
 end
 
--- Build a Skeet-style Data list of live enemies with their body parts (rebuilt each shot/frame).
+-- Build the enemy list from EVERY combatant model. FFA bots aren't Players — they're Models tagged
+-- "GameClient" (same tag real player characters get), so we enumerate that tag instead of GetPlayers.
 local function GatherEnemies()
     local myRoot = LocalRoot()
-    local list = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local char = plr.Character
-            local hum  = char and char:FindFirstChildOfClass("Humanoid")
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if char and hum and root and hum.Health > 0 and not PlayerFriendly(plr) then
-                local parts = {}
-                for i = 1, #HIT_POINTS do
-                    local p = char:FindFirstChild(HIT_POINTS[i])
-                    if p and p:IsA("BasePart") then parts[HIT_POINTS[i]] = p end
+    local myChar = LocalCharacter()
+    local list, seen = {}, {}
+
+    for _, model in ipairs(CollectionService:GetTagged("GameClient")) do
+        if model ~= myChar and not seen[model] and model:IsA("Model") then
+            seen[model] = true
+            local hum  = model:FindFirstChildOfClass("Humanoid")
+            local root = model:FindFirstChild("HumanoidRootPart")
+            if hum and root and hum.Health > 0 then
+                local plr = Players:GetPlayerFromCharacter(model)   -- nil for bots
+                if not ModelFriendly(model, plr) then
+                    local parts = {}
+                    for i = 1, #HIT_POINTS do
+                        local p = model:FindFirstChild(HIT_POINTS[i])
+                        if p and p:IsA("BasePart") then parts[HIT_POINTS[i]] = p end
+                    end
+                    list[#list + 1] = {
+                        Character = model, Player = plr, Humanoid = hum,
+                        RootPart = root, RootPosition = root.Position, BodyParts = parts,
+                        Distance = myRoot and (root.Position - myRoot.Position).Magnitude or 0,
+                    }
                 end
-                list[#list + 1] = {
-                    Character = char, Player = plr, Humanoid = hum,
-                    RootPart = root, RootPosition = root.Position, BodyParts = parts,
-                    Distance = myRoot and (root.Position - myRoot.Position).Magnitude or 0,
-                }
             end
         end
     end
@@ -618,39 +628,44 @@ local function GetPing()
 end
 
 -- Latest true root CFrame for a player from chrono's snapshot buffer, or nil.
-function Resolver.TrueRootCFrame(player)
+-- Find the chrono entry for a combatant by its player (real players) OR its character model (bots,
+-- which are registered as NPCs and have no .player). Returns the entry, which carries both the
+-- snapshot (true CFrame) and the velocity.
+function Resolver.FindEntry(player, character)
     local chrono = Resolver.GetChrono()
-    if not chrono or not player then return nil end
-
+    if not chrono then return nil end
     local ok, ids = pcall(chrono.GetAllNetworkIds)
     if not ok or type(ids) ~= "table" then return nil end
-
     for i = 1, #ids do
         local entry = chrono.idMap[ids[i]]
-        if entry and entry.player == player then
-            local snap = entry.snapshot and entry.snapshot:GetLatest()
-            if snap and typeof(snap.value) == "CFrame" then return snap.value end
-            return nil
+        if entry and ((player and entry.player == player) or (character and entry.character == character)) then
+            return entry
         end
     end
     return nil
 end
 
-function Resolver.TrueVelocity(player, fallbackPart)
-    local chrono = Resolver.GetChrono()
-    if chrono and player then
-        local ok, v = pcall(chrono.GetVelocity, player)
-        if ok and typeof(v) == "Vector3" and v.Magnitude > 0 then return v end
+function Resolver.TrueRootCFrame(player, character)
+    local entry = Resolver.FindEntry(player, character)
+    if not entry then return nil end
+    local snap = entry.snapshot and entry.snapshot:GetLatest()
+    if snap and typeof(snap.value) == "CFrame" then return snap.value end
+    return nil
+end
+
+function Resolver.TrueVelocity(player, character, fallbackPart)
+    local entry = Resolver.FindEntry(player, character)
+    if entry and typeof(entry.velocity) == "Vector3" and entry.velocity.Magnitude > 0 then
+        return entry.velocity
     end
     return (fallbackPart and fallbackPart.AssemblyLinearVelocity) or Vector3.new()
 end
 
--- Reproject a rendered aim point onto the true position, then add velocity lead. renderedRoot is the
--- rendered HumanoidRootPart; renderedPoint is where we'd aim on the rendered model (e.g. Head).
-function Resolver.ResolveAim(player, renderedRoot, renderedPoint)
+-- Reproject a rendered aim point onto the true position, then add velocity lead.
+function Resolver.ResolveAim(player, character, renderedRoot, renderedPoint)
     local point = renderedPoint
 
-    local trueCF = Resolver.TrueRootCFrame(player)
+    local trueCF = Resolver.TrueRootCFrame(player, character)
     if trueCF and renderedRoot then
         local delta = trueCF.Position - renderedRoot.Position
         if delta.Magnitude <= 10 then          -- sane correction only; ignore garbage snapshots
@@ -658,7 +673,7 @@ function Resolver.ResolveAim(player, renderedRoot, renderedPoint)
         end
     end
 
-    local lead = Resolver.TrueVelocity(player, renderedRoot) * (GetPing() * Config.Prediction)
+    local lead = Resolver.TrueVelocity(player, character, renderedRoot) * (GetPing() * Config.Prediction)
     if lead.Magnitude > 20 then lead = lead.Unit * 20 end   -- cap over-lead
 
     return point + lead
@@ -678,8 +693,8 @@ Ragebot.HooksInstalled = false
 
 -- Reproject a rendered world point onto the target's true (server) position — no lead (Skeet's
 -- ReprojectPoint). Returns the input unchanged if there's no valid true position.
-function Resolver.ReprojectPoint(player, renderedRoot, worldPoint)
-    local trueCF = Resolver.TrueRootCFrame(player)
+function Resolver.ReprojectPoint(player, character, renderedRoot, worldPoint)
+    local trueCF = Resolver.TrueRootCFrame(player, character)
     if not renderedRoot or not trueCF then return worldPoint end
     local delta = trueCF.Position - renderedRoot.Position
     if delta.Magnitude > 10 then return worldPoint end   -- garbage snapshot, don't correct
@@ -696,7 +711,7 @@ local function SelectTarget(enemies, origin)
             local blocked = false
             if Config.WallCheck and origin then
                 local rootPos = data.RootPosition
-                local trueCF = Resolver.TrueRootCFrame(data.Player)
+                local trueCF = Resolver.TrueRootCFrame(data.Player, data.Character)
                 if trueCF and (trueCF.Position - rootPos).Magnitude <= 10 then rootPos = trueCF.Position end
 
                 local rootBlocked = RayBlocked(origin, rootPos)
@@ -738,9 +753,9 @@ local function PickPoint(data, origin)
     if not part then return nil end
 
     local position = visiblePoint or part.Position
-    position = Resolver.ReprojectPoint(data.Player, data.RootPart, position)
+    position = Resolver.ReprojectPoint(data.Player, data.Character, data.RootPart, position)
 
-    local lead = Resolver.TrueVelocity(data.Player, data.RootPart) * (GetPing() * Config.Prediction)
+    local lead = Resolver.TrueVelocity(data.Player, data.Character, data.RootPart) * (GetPing() * Config.Prediction)
     if lead.Magnitude > 20 then lead = lead.Unit * 20 end
     position = position + lead
 
@@ -931,7 +946,7 @@ local function TargetHeadPos(target)
     local base = head and head.Position or (root and (root.Position + Vector3.new(0, 1.5, 0)))
     if not base then return nil end
     local plr = Players:GetPlayerFromCharacter(target)
-    return Resolver.ReprojectPoint(plr, root, base)
+    return Resolver.ReprojectPoint(plr, target, root, base)
 end
 
 local function StepCamlock()
@@ -1060,6 +1075,21 @@ local function WalkToward(targetPos)
     end
 end
 
+-- Roam: when there's no target, wander to a random nearby point so we cover the map and find bots.
+local Roam = { Goal = nil, Until = 0 }
+local function RoamStep()
+    local hum = LocalCharacter() and LocalCharacter():FindFirstChildOfClass("Humanoid")
+    local root = LocalRoot()
+    if not hum or not root then return end
+    if not Roam.Goal or os.clock() > Roam.Until or (root.Position - Roam.Goal).Magnitude < 8 then
+        local angle = math.random() * math.pi * 2
+        local dist = 40 + math.random() * 60
+        Roam.Goal = root.Position + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+        Roam.Until = os.clock() + 5
+    end
+    hum:MoveTo(Roam.Goal)
+end
+
 Connect(RunService.Heartbeat, function()
     if not Ready or not Config.Pathfind or not Alive() then return end
     if not IsGaming() then if #PathViz.Parts > 0 then ClearPathViz() end return end
@@ -1069,8 +1099,9 @@ Connect(RunService.Heartbeat, function()
         if root then
             SafeCall("pathfind.walk", WalkToward, root.Position)
         end
-    elseif #PathViz.Parts > 0 then
-        ClearPathViz()
+    else
+        if #PathViz.Parts > 0 then ClearPathViz() end
+        SafeCall("roam", RoamStep)   -- no target -> wander to find bots
     end
 end)
 
@@ -1114,7 +1145,7 @@ end)
 -- its own name (Stat.Kill == "Kill", Status.Level == "Level", ...). Using the strings directly means
 -- we never dot-index a not-yet-replicated Constant module at load time (which hard-errors the script).
 local StatKey       = { Kill="Kill", HeadshotKill="HeadshotKill", Death="Death", Win="Win", Lose="Lose" }
-local StatusKey     = { Level="Level", Eco_Coin="Eco_Coin", NetWorth="NetWorth", WeaponValue="WeaponValue", Gachaed="Gachaed", MysticWeaponCount="MysticWeaponCount" }
+local StatusKey     = { Level="Level", Eco_Coin="Eco_Coin", NetWorth="NetWorth", WeaponValue="WeaponValue", Gachaed="Gachaed", MysticWeaponCount="MysticWeaponCount", Killed="Killed", GamePlayed="GamePlayed" }
 local RankedModeKey = { Duel="Duel", Arcade="Arcade" }
 
 -- Safe child resolve so a missing/late remote returns nil instead of throwing on dot-index.
@@ -1540,6 +1571,59 @@ local function SendReport(force)
 end
 
 --=====================================================================
+-- Auto Beginner Server  (fresh accounts must clear the newbie FFA before ranked)
+--=====================================================================
+-- Requirement (Config/Beginner.lua -> ToBeginnerServer): Status.Killed >= 50 AND GamePlayed >= 2.
+-- In a newbie/arcade server "Play" is just the Respawn context action, which drops you into the
+-- running FFA room; the ragebot then farms the kills.
+local function InBeginnerServer()
+    local srv = ServerModule()
+    if not srv then return false end
+    local nOk, newbie = pcall(srv.IsNewbie)
+    local aOk, arcade = pcall(srv.IsArcade)
+    return (nOk and newbie == true) and (aOk and arcade == true)
+end
+
+local function BeginnerKills()   return GetStatus(StatusKey.Killed) end
+local function BeginnerGames()   return GetStatus(StatusKey.GamePlayed) end
+local function BeginnerDone()    return BeginnerKills() >= 50 and BeginnerGames() >= 2 end
+
+-- Press "Play" = fire the Respawn action, spawning us into the FFA room.
+local function PressPlay()
+    local ac = ActionCtrl()
+    if ac and ac.Call then
+        pcall(ac.Call, "Respawn", Enum.UserInputState.Begin)
+    end
+end
+
+local function LocalAlive()
+    local c = LocalCharacter()
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+-- Beginner loop: keep pressing Play (respawn) while we're dead, until the 50 kills / 2 games are done.
+-- The ragebot (already running, gated on IsGaming) does the actual killing.
+local function BeginnerLoop()
+    while Alive() do
+        if InBeginnerServer() and not BeginnerDone() then
+            if not LocalAlive() then
+                PressPlay()
+                if Config.Debug then
+                    Log(("beginner: kills=%d/50 games=%d/2 -> respawning"):format(BeginnerKills(), BeginnerGames()))
+                end
+            end
+            task.wait(2)
+        else
+            if InBeginnerServer() and BeginnerDone() then
+                Log("beginner COMPLETE — 50 kills + 2 games done")
+            end
+            task.wait(5)
+        end
+    end
+end
+
+--=====================================================================
 -- Main loops
 --=====================================================================
 -- Everything waits for WaitForGameReady() first, and each heavy action goes through Throttled()
@@ -1558,8 +1642,11 @@ task.spawn(function()
         end
     end)
 
-    -- Heavy actions loop (buy/open, sell, equip, claim) — one at a time, spaced out. Requeue is NOT
-    -- here: it must be fast, not stuck behind seconds of throttled shop/inventory work.
+    -- Auto beginner-server clear (the current focus): press Play into FFA, ragebot farms the kills.
+    task.spawn(BeginnerLoop)
+
+    --[[ RANKED FARM — commented out while we clear beginner servers. Re-enable once graduated.
+    -- Heavy actions loop (buy/open, sell, equip, claim) — one at a time, spaced out.
     task.spawn(function()
         while Alive() do
             Throttled("buycase", DoBuyAndOpenCase)
@@ -1570,16 +1657,16 @@ task.spawn(function()
         end
     end)
 
-    -- Fast lifecycle loop (1s): everything that gets us into the next match ASAP —
-    -- rematch off the endgame screen, requeue from the lobby, and ban/vote maps. All idempotent.
+    -- Fast lifecycle loop (1s): rematch/requeue + ban/vote maps.
     task.spawn(function()
         while Alive() do
-            SafeCall("playagain", PlayAgain)      -- endgame screen -> requeue same ranked queue
-            SafeCall("tryqueue", TryQueue)        -- lobby -> queue ranked 1v1
-            SafeCall("mapphase", AutoMapPhase)    -- ban then vote so the round starts
+            SafeCall("playagain", PlayAgain)
+            SafeCall("tryqueue", TryQueue)
+            SafeCall("mapphase", AutoMapPhase)
             task.wait(1)
         end
     end)
+    --]]
 
     -- Debug state readout so we can see exactly which gate is blocking (turn off via Config.Debug).
     task.spawn(function()
