@@ -41,6 +41,7 @@ local Config = {
     CamJitter     = 0.45,
     Pathfind      = true,          -- walk to the current target with PathfindingService
     StayInSpawn   = true,          -- don't move at all — just hold position and silent-aim
+    SpamJump      = true,          -- continuously jump (harder to hit)
     WalkSpeed     = 22,            -- forced humanoid walkspeed (0 = don't touch it). Sprint state gets
                                    -- cancelled by MoveTo, so we just set speed directly instead.
     AutoRequeue   = true,
@@ -98,7 +99,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r11"
+local FARM_VERSION = "2026-08-05-beginner-r13"
 
 local function Log(...)
     print("[farm]", ...)
@@ -763,24 +764,22 @@ end
 
 -- SelectTarget: closest live enemy we actually have line of sight to. Skips a target whose root is
 -- wall-blocked AND whose head has no visible point — exactly Skeet's wall check.
+-- Is ANY body part of this enemy visible from origin? (single ray each — fast)
+local function AnyPartVisible(data, origin)
+    for i = 1, #HIT_POINTS do
+        local p = data.BodyParts[HIT_POINTS[i]]
+        if p and not RayBlocked(origin, p.Position) then return true end
+    end
+    return false
+end
+
 local function SelectTarget(enemies, origin)
     local best, bestScore = nil, math.huge
     for i = 1, #enemies do
         local data = enemies[i]
         if data.Humanoid.Health > 0 then
-            local blocked = false
-            if Config.WallCheck and origin then
-                local rootPos = data.RootPosition
-                local trueCF = Resolver.TrueRootCFrame(data.Player, data.Character)
-                if trueCF and (trueCF.Position - rootPos).Magnitude <= 10 then rootPos = trueCF.Position end
-
-                local rootBlocked = RayBlocked(origin, rootPos)
-                local head = rootBlocked and data.BodyParts["Head"]
-                local visibleHead = head and SampleVisiblePoint(origin, head)
-                if rootBlocked and not visibleHead then blocked = true end
-            end
-
-            if not blocked and data.Distance < bestScore then
+            local visible = (not Config.WallCheck or not origin) or AnyPartVisible(data, origin)
+            if visible and data.Distance < bestScore then
                 bestScore = data.Distance
                 best = data
             end
@@ -789,37 +788,26 @@ local function SelectTarget(enemies, origin)
     return best
 end
 
--- PickPoint: choose the best VISIBLE body point (Head first), reproject to true pos, add velocity
--- lead. Returns (part, worldPosition) or nil if every candidate is wall-blocked. 1:1 with Skeet.
+-- PickPoint: first body part whose CENTER is visible (ONE ray each — fast). Everything one-shots in
+-- this game, so we don't insist on the head — whatever's exposed gets shot. Reproject + lead.
+-- Returns (part, worldPosition), or nil if every part is wall-blocked.
 local function PickPoint(data, origin)
-    local candidates = {}
+    local part
     for i = 1, #HIT_POINTS do
         local p = data.BodyParts[HIT_POINTS[i]]
-        if p then candidates[#candidates + 1] = p end
+        if p and (not Config.WallCheck or not origin or not RayBlocked(origin, p.Position)) then
+            part = p
+            break
+        end
     end
-
-    if #candidates == 0 then return nil end
-
-    local part, visiblePoint
-    for i = 1, #candidates do
-        local cand = candidates[i]
-        if not Config.WallCheck or not origin then part = cand break end
-        if not RayBlocked(origin, cand.Position) then part = cand break end
-        local sampled = SampleVisiblePoint(origin, cand)
-        if sampled then part = cand; visiblePoint = sampled break end
-    end
-
-    -- No visible point (fully wall-blocked) → no shot, exactly like Skeet. Pathfinding walks us to LoS.
     if not part then return nil end
 
-    local position = visiblePoint or part.Position
-    position = Resolver.ReprojectPoint(data.Player, data.Character, data.RootPart, position)
+    local position = Resolver.ReprojectPoint(data.Player, data.Character, data.RootPart, part.Position)
 
     local lead = Resolver.TrueVelocity(data.Player, data.Character, data.RootPart) * (GetPing() * Config.Prediction)
     if lead.Magnitude > 20 then lead = lead.Unit * 20 end
-    position = position + lead
 
-    return part, position
+    return part, position + lead
 end
 
 local function InstallFireHooks()
@@ -1205,6 +1193,20 @@ end
 if LocalPlayer.Character then task.spawn(HookWalkSpeed, LocalPlayer.Character) end
 Connect(LocalPlayer.CharacterAdded, function(char)
     task.spawn(HookWalkSpeed, char)
+end)
+
+--=====================================================================
+-- Spam jump  (bhop — makes us harder to hit)
+--=====================================================================
+Connect(RunService.Heartbeat, function()
+    if not Config.SpamJump or not Ready or not Alive() or not IsGaming() then return end
+    local hum = LocalCharacter() and LocalCharacter():FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+    end
+    -- Also fire the game's own Jump action in case movement is entity-state driven.
+    local ac = ActionCtrl()
+    if ac and ac.Call then pcall(ac.Call, "Jump", Enum.UserInputState.Begin) end
 end)
 
 --=====================================================================
