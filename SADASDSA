@@ -96,7 +96,7 @@ while not LocalPlayer do
 end
 local Camera = Workspace.CurrentCamera
 
-local FARM_VERSION = "2026-08-05-beginner-r6"
+local FARM_VERSION = "2026-08-05-beginner-r7"
 
 local function Log(...)
     print("[farm]", ...)
@@ -1625,13 +1625,24 @@ local function BeginnerKills()   return GetStatus(StatusKey.Killed) end
 local function BeginnerGames()   return GetStatus(StatusKey.GamePlayed) end
 local function BeginnerDone()    return BeginnerKills() >= 50 and BeginnerGames() >= 2 end
 
--- Press "Play" = fire the Respawn action. The game's own handler then joins the running FFA room
--- (GameService.Join) and fast-respawns us — so this covers both first spawn and respawns.
+-- Press "Play". First fire the Respawn action (what the UI button does); then, as a robust fallback,
+-- do exactly what the game's Respawn handler does: join the running FFA room + fast-respawn.
 local function PressPlay()
     local ac = ActionCtrl()
     if ac and ac.Call then
         pcall(ac.Call, "Respawn", Enum.UserInputState.Begin)
     end
+
+    local gs = GameService()
+    local srv = ServerModule()
+    if not gs then return end
+
+    local running = srv and srv.RunningRoom and srv.RunningRoom.Value
+    local joined = gs.IsJoined and select(2, pcall(gs.IsJoined))
+    if not joined and running and #running > 0 and gs.Join then
+        pcall(gs.Join, { Room = running })
+    end
+    if gs.FastRespawn then pcall(gs.FastRespawn) end
 end
 
 -- Turn on the game's AutoRespawn setting so death -> instant respawn without us pressing anything.
@@ -1699,39 +1710,38 @@ task.spawn(function()
         Log("place: " .. Place)
     end
 
-    -- Auto beginner-server clear (the current focus): press Play into FFA, ragebot farms the kills.
-    task.spawn(BeginnerLoop)
+    -- Place-aware behaviour:
+    if Place == "beginner" then
+        -- Beginner FFA clear: press Play into the room, ragebot farms bots for 50 kills / 2 games.
+        task.spawn(BeginnerLoop)
+    else
+        -- Ranked / lobby: full ranked farm.
+        task.spawn(function()   -- heavy actions (buy/open, sell, equip, claim)
+            while Alive() do
+                Throttled("buycase", DoBuyAndOpenCase)
+                Throttled("autosell", DoAutoSell)
+                Throttled("autoequip", DoAutoEquip)
+                Throttled("autoclaim", DoAutoClaim)
+                task.wait(Config.LoopInterval)
+            end
+        end)
 
-    -- Map ban/vote — always on (works in ranked even while the rest of the ranked farm is off).
+        task.spawn(function()   -- fast lifecycle: rematch off endgame + requeue from lobby
+            while Alive() do
+                SafeCall("playagain", PlayAgain)
+                SafeCall("tryqueue", TryQueue)
+                task.wait(1)
+            end
+        end)
+    end
+
+    -- Map ban/vote — always on (ranked needs it; a no-op elsewhere).
     task.spawn(function()
         while Alive() do
             SafeCall("mapphase", AutoMapPhase)
             task.wait(1)
         end
     end)
-
-    --[[ RANKED FARM — commented out while we clear beginner servers. Re-enable once graduated.
-    -- Heavy actions loop (buy/open, sell, equip, claim) — one at a time, spaced out.
-    task.spawn(function()
-        while Alive() do
-            Throttled("buycase", DoBuyAndOpenCase)
-            Throttled("autosell", DoAutoSell)
-            Throttled("autoequip", DoAutoEquip)
-            Throttled("autoclaim", DoAutoClaim)
-            task.wait(Config.LoopInterval)
-        end
-    end)
-
-    -- Fast lifecycle loop (1s): rematch/requeue + ban/vote maps.
-    task.spawn(function()
-        while Alive() do
-            SafeCall("playagain", PlayAgain)
-            SafeCall("tryqueue", TryQueue)
-            SafeCall("mapphase", AutoMapPhase)
-            task.wait(1)
-        end
-    end)
-    --]]
 
     -- Debug state readout so we can see exactly which gate is blocking (turn off via Config.Debug).
     task.spawn(function()
